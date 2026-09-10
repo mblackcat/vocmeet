@@ -98,6 +98,5 @@ jobs:
           set -euo pipefail
           v="${{ steps.bump.outputs.new_version }}"
           # tag push 用的是 GITHUB_TOKEN，不会自动触发其它工作流的 push 事件，
-          # 所以这里显式 dispatch release.yml，并指定 --ref 为新 tag，
-          # 让它内部的 ${{ github.ref_name }} 就是 v$v。
-          gh workflow run release.yml --ref "v$v" --repo "${{ github.repository }}"
+          # 所以这里显式 dispatch release.yml，用 tag 参数指定要构建哪个版本。
+          gh workflow run release.yml --ref main -f "tag=v$v" --repo "${{ github.repository }}"

@@ -5,6 +5,11 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag:
+        description: "要构建并发布的 tag（例如 v0.2.0）；留空则用触发时的 ref"
+        required: false
+        type: string
 
 jobs:
   release:
@@ -21,8 +26,12 @@ jobs:
             args: ""
 
     runs-on: ${{ matrix.platform }}
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ env.RELEASE_TAG }}
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
@@ -44,10 +53,10 @@ jobs:
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
-          tagName: ${{ github.ref_name }}
-          releaseName: 'VocMeet ${{ github.ref_name }}'
+          tagName: ${{ env.RELEASE_TAG }}
+          releaseName: 'VocMeet ${{ env.RELEASE_TAG }}'
           releaseBody: |
-            ## VocMeet 声会 ${{ github.ref_name }} 发布日志
+            ## VocMeet 声会 ${{ env.RELEASE_TAG }} 发布日志
 
             ### 安装说明
             - 首次安装运行后，请前往「设置」页点击「一键下载模型」以初始化离线语音识别与说话人分离权重。
@@ -66,8 +75,10 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+    env:
+      RELEASE_TAG: ${{ github.event.inputs.tag || github.ref_name }}
     steps:
       - name: 取消草稿，正式发布
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"
+        run: gh release edit "${{ env.RELEASE_TAG }}" --draft=false --repo "${{ github.repository }}"
