@@ -1,0 +1,1 @@
+{"default":{"identifier":"default","description":"主窗口所需的最小权限：事件订阅（进度回推与文件拖放）与文件选择框。","local":true,"windows":["main"],"permissions":["core:default","dialog:allow-open","dialog:allow-save"]}}

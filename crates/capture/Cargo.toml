@@ -1,0 +1,14 @@
+[package]
+name = "vocmeet-capture"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+vocmeet-core = { path = "../core" }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+serde.workspace = true
+
+[target."cfg(windows)".dependencies]
+wasapi = "0.24"

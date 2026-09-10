@@ -1,0 +1,36 @@
+[workspace]
+resolver = "2"
+members = ["crates/core", "crates/capture", "crates/cli", "src-tauri"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "Apache-2.0"
+
+[workspace.dependencies]
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+sherpa-onnx = { version = "1.13.6", default-features = false, features = ["static"] }
+rusqlite = { version = "0.40", features = ["bundled"] }
+keyring = "4"
+minijinja = { version = "2", features = ["loader"] }
+rubato = "0.16"
+reqwest = { version = "0.12", default-features = false, features = ["json", "stream", "rustls-tls"] }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "fs"] }
+futures-util = "0.3"
+sha2 = "0.10"
+hex = "0.4"
+rand = "0.9"
+time = { version = "0.3", features = ["formatting", "macros", "local-offset"] }
+hound = "3.5"
+tar = "0.4"
+bzip2-rs = "0.1"
+symphonia = { version = "0.6", default-features = false, features = ["all-codecs", "all-formats", "opt-simd"] }
+tiktoken-rs = "0.12"
+aes-gcm = "0.10"
+base64 = "0.22"
