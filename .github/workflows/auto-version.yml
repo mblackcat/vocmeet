@@ -14,6 +14,7 @@ on:
 
 permissions:
   contents: write
+  actions: write
 
 jobs:
   tag:
@@ -89,3 +90,14 @@ jobs:
           git tag "v$v"
           git push origin HEAD:main
           git push origin "v$v"
+
+      - name: 触发 release 构建
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          v="${{ steps.bump.outputs.new_version }}"
+          # tag push 用的是 GITHUB_TOKEN，不会自动触发其它工作流的 push 事件，
+          # 所以这里显式 dispatch release.yml，并指定 --ref 为新 tag，
+          # 让它内部的 ${{ github.ref_name }} 就是 v$v。
+          gh workflow run release.yml --ref "v$v" --repo "${{ github.repository }}"
