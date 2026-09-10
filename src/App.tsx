@@ -313,7 +313,10 @@ export default function App() {
     <div className="shell">
       <aside className="rail">
         <div className="rail-head">
-          <h1>VocMeet</h1>
+          <div className="rail-brand">
+            <img src="/logo.png" alt="VocMeet" className="rail-brand-logo" />
+            <h1>VocMeet</h1>
+          </div>
           <div className="rail-head-actions">
             <button
               className={showParticipants ? "gear on" : "gear"}
