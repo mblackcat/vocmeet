@@ -9,6 +9,7 @@ import Session from "./views/Session";
 import MeetingView from "./views/MeetingView";
 import Settings from "./views/Settings";
 import MeetingContextMenu from "./MeetingContextMenu";
+import ParticipantModal from "./components/ParticipantModal";
 
 const PAGE = 20;
 
@@ -64,6 +65,10 @@ export default function App() {
 
   /** 正在整理的会议 id —— 用户只需要知道「在整理」。 */
   const [busyId, setBusyId] = useState<number | null>(null);
+  /** 参会人管理弹窗显隐 */
+  const [showParticipants, setShowParticipants] = useState(false);
+  /** 记录各会议当前的整理阶段（transcribing / summarizing） */
+  const [meetingPhases, setMeetingPhases] = useState<Record<number, "transcribing" | "summarizing">>({});
 
   /** 可导入的扩展名，由后端给。前端不另维护一份，免得两边说法不一致。 */
   const [audioExts, setAudioExts] = useState<string[]>([]);
@@ -106,8 +111,23 @@ export default function App() {
   useEffect(() => {
     const off: Array<() => void> = [];
     void events
+      .onProcessProgress((e) => {
+        if (e.phase === "transcribing" || e.phase === "importing") {
+          setMeetingPhases((cur) => ({ ...cur, [e.meeting_id]: "transcribing" }));
+        } else if (e.phase === "summarizing") {
+          setMeetingPhases((cur) => ({ ...cur, [e.meeting_id]: "summarizing" }));
+        }
+      })
+      .then((f) => off.push(f));
+
+    void events
       .onProcessDone((e) => {
         setBusyId(null);
+        setMeetingPhases((cur) => {
+          const next = { ...cur };
+          delete next[e.meeting_id];
+          return next;
+        });
         void loadFirstPage();
         if (e.phase === "failed") setError(e.detail);
       })
@@ -294,18 +314,34 @@ export default function App() {
       <aside className="rail">
         <div className="rail-head">
           <h1>VocMeet</h1>
-          <button
-            className={stage.kind === "settings" ? "gear on" : "gear"}
-            title="设置"
-            aria-label="设置"
-            onClick={() => setStage({ kind: "settings" })}
-          >
-            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
-                 strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
-              <circle cx="12" cy="12" r="3" />
-              <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
-            </svg>
-          </button>
+          <div className="rail-head-actions">
+            <button
+              className={showParticipants ? "gear on" : "gear"}
+              title="参会人管理"
+              aria-label="参会人管理"
+              onClick={() => setShowParticipants(true)}
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                <path d="M16 21v-2a4 4 0 0 0-4-4H6a4 4 0 0 0-4 4v2" />
+                <circle cx="9" cy="7" r="4" />
+                <path d="M22 21v-2a4 4 0 0 0-3-3.87" />
+                <path d="M16 3.13a4 4 0 0 1 0 7.75" />
+              </svg>
+            </button>
+            <button
+              className={stage.kind === "settings" ? "gear on" : "gear"}
+              title="设置"
+              aria-label="设置"
+              onClick={() => setStage({ kind: "settings" })}
+            >
+              <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                   strokeWidth="1.4" strokeLinecap="round" strokeLinejoin="round">
+                <circle cx="12" cy="12" r="3" />
+                <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z" />
+              </svg>
+            </button>
+          </div>
         </div>
 
         <button
@@ -320,27 +356,52 @@ export default function App() {
         <div className="rail-list">
           <span className="label">会议 {total > 0 ? total : ""}</span>
           {meetings.length === 0 && <div className="hollow">还没有会议</div>}
-          {meetings.map((m) => (
-            <button
-              key={m.id}
-              className={stage.kind === "meeting" && stage.id === m.id ? "entry on" : "entry"}
-              onClick={() =>
-                m.id === liveId
-                  ? setStage({ kind: "session" })
-                  : setStage({ kind: "meeting", id: m.id })
-              }
-              onContextMenu={(e) => {
-                e.preventDefault();
-                e.stopPropagation();
-                setMenu({ x: e.clientX, y: e.clientY, meeting: m });
-              }}
-            >
-              <span className="t">{m.title}</span>
-              <span className="m data">
-                {m.started_at.slice(5, 16).replace("T", " ")} · {statusText(m)}
-              </span>
-            </button>
-          ))}
+          {meetings.map((m) => {
+            const isLive = m.id === liveId;
+            const phase = meetingPhases[m.id] || (m.id === busyId || m.status === "processing" ? "transcribing" : null);
+
+            return (
+              <button
+                key={m.id}
+                className={stage.kind === "meeting" && stage.id === m.id ? "entry on" : "entry"}
+                onClick={() =>
+                  m.id === liveId
+                    ? setStage({ kind: "session" })
+                    : setStage({ kind: "meeting", id: m.id })
+                }
+                onContextMenu={(e) => {
+                  e.preventDefault();
+                  e.stopPropagation();
+                  setMenu({ x: e.clientX, y: e.clientY, meeting: m });
+                }}
+              >
+                <div className="entry-head-line">
+                  <span className="t">{m.title}</span>
+                  {isLive && (
+                    <span className="rail-tag live">
+                      <span className="status-dot live" />
+                      <span>录制中</span>
+                    </span>
+                  )}
+                  {!isLive && phase === "transcribing" && (
+                    <span className="rail-tag transcribing">
+                      <span className="status-dot pulsing" />
+                      <span>解析录音中</span>
+                    </span>
+                  )}
+                  {!isLive && phase === "summarizing" && (
+                    <span className="rail-tag summarizing">
+                      <span className="status-dot pulsing" />
+                      <span>生成会议纪要中</span>
+                    </span>
+                  )}
+                </div>
+                <span className="m data">
+                  {m.started_at.slice(5, 16).replace("T", " ")} · {statusText(m)}
+                </span>
+              </button>
+            );
+          })}
           {meetings.length < total && (
             <button className="more" disabled={loadingMore} onClick={() => void loadMore()}>
               {loadingMore ? "加载中" : `加载更多 · 还有 ${total - meetings.length} 场`}
@@ -387,6 +448,7 @@ export default function App() {
           )}
           {stage.kind === "meeting" && (
             <MeetingView
+              key={stage.id}
               meetingId={stage.id}
               onError={setError}
               onChanged={loadFirstPage}
@@ -429,6 +491,13 @@ export default function App() {
           onExportTranscript={handleExportTranscript}
           onExportSummary={handleExportSummary}
           onArchive={handleArchive}
+        />
+      )}
+
+      {showParticipants && (
+        <ParticipantModal
+          onClose={() => setShowParticipants(false)}
+          onError={setError}
         />
       )}
     </div>

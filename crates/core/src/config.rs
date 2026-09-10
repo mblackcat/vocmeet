@@ -16,6 +16,15 @@ pub struct Config {
     pub models_dir: PathBuf,
     /// 提示词模板目录。
     pub templates_dir: PathBuf,
+    /// 逐字稿落盘目录。如果未特别指定则默认在 data_dir/transcripts。
+    #[serde(default)]
+    pub transcripts_dir: Option<PathBuf>,
+    /// 预设信息：行业词与自定义专用词库（如游戏行业术语等）。
+    #[serde(default)]
+    pub preset_terms: Vec<String>,
+    /// 预设信息：系统提示词微调/补充要求。
+    #[serde(default)]
+    pub preset_prompt: String,
     pub egress_policy: EgressPolicy,
     pub llm: LlmConfig,
     pub engine: EngineConfig,
@@ -120,6 +129,13 @@ impl Default for Config {
             // 于是「模型明明在盘上却报 not found」。见 §6。
             models_dir: data_dir.join("models"),
             templates_dir: data_dir.join("templates"),
+            transcripts_dir: Some(data_dir.join("transcripts")),
+            preset_terms: vec![
+                "ASR".into(), "NPC".into(), "PVP".into(), "PVE".into(), "DAU".into(),
+                "MAU".into(), "MMORPG".into(), "GaaS".into(), "UE5".into(), "Unity".into(),
+                "骨骼动画".into(), "帧同步".into(), "状态同步".into(), "数值平衡".into()
+            ],
+            preset_prompt: String::new(),
             egress_policy: EgressPolicy::default(),
             llm: LlmConfig::default(),
             engine: EngineConfig::default(),
@@ -187,6 +203,15 @@ impl Config {
                 self.data_dir = cwd.join(&self.data_dir);
             }
         }
+        if let Some(td) = &mut self.transcripts_dir {
+            if !td.is_absolute() {
+                let from_cwd = std::env::current_dir().ok().map(|d| d.join(&*td));
+                *td = match from_cwd {
+                    Some(p) if p.exists() => p,
+                    _ => self.data_dir.join(&*td),
+                };
+            }
+        }
     }
 
     /// 首次启动时，把权重目录指到实际存在的那一份。
@@ -229,8 +254,16 @@ impl Config {
         self.data_dir.join("audio")
     }
 
+    pub fn transcripts_dir(&self) -> PathBuf {
+        match &self.transcripts_dir {
+            Some(d) if d.is_absolute() => d.clone(),
+            Some(d) => self.data_dir.join(d),
+            None => self.data_dir.join("transcripts"),
+        }
+    }
+
     pub fn ensure_dirs(&self) -> Result<()> {
-        for d in [&self.data_dir, &self.audio_dir()] {
+        for d in [&self.data_dir, &self.audio_dir(), &self.transcripts_dir()] {
             std::fs::create_dir_all(d).map_err(|e| Error::io(d, e))?;
         }
         Ok(())

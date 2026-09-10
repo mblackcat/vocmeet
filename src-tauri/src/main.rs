@@ -224,6 +224,7 @@ struct MeetingDetail {
     attendees: Vec<String>,
     summary: Option<String>,
     playback_path: Option<String>,
+    transcript_path: Option<String>,
     utterance_count: usize,
     note: String,
 }
@@ -250,6 +251,7 @@ fn get_meeting_detail(state: State<AppState>, meeting_id: i64) -> R<MeetingDetai
         keywords: store.get_keywords(meeting_id).map_err(err)?,
         summary: store.latest_summary(meeting_id).map_err(err)?,
         playback_path: store.get_playback_path(meeting_id).map_err(err)?,
+        transcript_path: store.get_transcript_path(meeting_id).map_err(err)?,
         utterance_count: utterances.len(),
         note: store.load_note(meeting_id).map_err(err)?,
         attendees,
@@ -566,6 +568,44 @@ fn run_transcription(
         .set_meeting_status(meeting_id, "transcribed")
         .map_err(err)?;
 
+    // 逐字稿自动落盘到配置的落盘目录，并记录绝对地址
+    let transcripts_dir = cfg.transcripts_dir();
+    let _ = std::fs::create_dir_all(&transcripts_dir);
+    let title = store
+        .get_meeting(meeting_id)
+        .ok()
+        .flatten()
+        .map(|m| m.title)
+        .unwrap_or_else(|| format!("会议_{meeting_id}"));
+    let safe_title: String = title
+        .chars()
+        .map(|c| {
+            if c.is_alphanumeric() || c == '_' || c == '-' || ('\u{4e00}'..='\u{9fa5}').contains(&c) {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let transcript_file = transcripts_dir.join(format!("{safe_title}_{meeting_id}_逐字稿.md"));
+    let mut md = format!("# 会议逐字稿 - {}\n\n", title);
+    md.push_str(&format!("- 会议编号：{}\n", meeting_id));
+    md.push_str(&format!("- 生成时间：{}\n", now_iso()));
+    md.push_str(&format!("- 发言条数：{}\n\n", utterances.len()));
+    for u in &utterances {
+        let mark = if u.low_confidence { " *(识别存疑)*" } else { "" };
+        md.push_str(&format!(
+            "**[{}]** `{}`：{}{}\n\n",
+            u.display_speaker(),
+            format_ts(u.start_ms),
+            u.text,
+            mark
+        ));
+    }
+    if let Ok(()) = std::fs::write(&transcript_file, md) {
+        let _ = store.set_transcript_path(meeting_id, &transcript_file.display().to_string());
+    }
+
     Ok(utterances.len())
 }
 
@@ -806,6 +846,25 @@ fn set_models_dir(state: State<AppState>, path: String) -> R<String> {
     guard.models_dir = dir;
     guard.save(&state.config_path).map_err(err)?;
     Ok(format!("已指向 {path}"))
+}
+
+/// 修改逐字稿落盘目录。修改不影响已有旧会议的逐字稿路径。
+#[tauri::command]
+fn set_transcripts_dir(state: State<AppState>, path: String) -> R<String> {
+    let dir = PathBuf::from(&path);
+    if !dir.is_dir() {
+        std::fs::create_dir_all(&dir).map_err(err)?;
+    }
+    let mut guard = state.config.lock().map_err(|_| "配置锁中毒")?;
+    guard.transcripts_dir = Some(dir);
+    guard.save(&state.config_path).map_err(err)?;
+    Ok(format!("已修改逐字稿落盘目录：{path}"))
+}
+
+/// 参会人管理：列出全局所有会议出现过的参会人聚合列表。
+#[tauri::command]
+fn list_all_participants(state: State<AppState>) -> R<Vec<vocmeet_core::store::ParticipantInfo>> {
+    state.store()?.list_all_participants().map_err(err)
 }
 
 /// LLM 端点体检。分清「没起来」「没模型」「模型名不对」。
@@ -1808,6 +1867,8 @@ fn main() {
             download_models,
             cancel_model_download,
             set_models_dir,
+            set_transcripts_dir,
+            list_all_participants,
             diagnose_llm,
             pull_llm_model,
             suggested_llm_models,

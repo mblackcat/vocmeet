@@ -19,6 +19,7 @@ import type {
   SpeakerRow,
   StopResult,
   Utterance,
+  ParticipantInfo,
 } from "./types";
 
 export const api = {
@@ -101,6 +102,8 @@ export const api = {
   downloadModels: () => invoke<void>("download_models"),
   cancelModelDownload: () => invoke<void>("cancel_model_download"),
   setModelsDir: (path: string) => invoke<string>("set_models_dir", { path }),
+  setTranscriptsDir: (path: string) => invoke<string>("set_transcripts_dir", { path }),
+  listAllParticipants: () => invoke<ParticipantInfo[]>("list_all_participants"),
   diagnoseLlm: () => invoke<LlmDiagnosis>("diagnose_llm"),
   pullLlmModel: (model: string) => invoke<void>("pull_llm_model", { model }),
   suggestedLlmModels: () => invoke<SuggestedModel[]>("suggested_llm_models"),

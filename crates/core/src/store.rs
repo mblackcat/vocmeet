@@ -237,12 +237,13 @@ impl Store {
                 created_at TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
-            -- 会议级派生数据：主题关键词与合并后的回放音轨。
+            -- 会议级派生数据：主题关键词与合并后的回放音轨、逐字稿文件落盘路径。
             CREATE TABLE IF NOT EXISTS meeting_meta (
-                meeting_id    INTEGER PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
-                keywords      TEXT NOT NULL DEFAULT '[]',
-                playback_path TEXT,
-                updated_at    TEXT NOT NULL DEFAULT (datetime('now'))
+                meeting_id      INTEGER PRIMARY KEY REFERENCES meetings(id) ON DELETE CASCADE,
+                keywords        TEXT NOT NULL DEFAULT '[]',
+                playback_path   TEXT,
+                transcript_path TEXT,
+                updated_at      TEXT NOT NULL DEFAULT (datetime('now'))
             );
 
             CREATE INDEX IF NOT EXISTS idx_utt_meeting ON utterances(meeting_id, ordinal);
@@ -250,6 +251,7 @@ impl Store {
             "#,
         )?;
         let _ = self.conn.execute("ALTER TABLE meetings ADD COLUMN archived_at TEXT", []);
+        let _ = self.conn.execute("ALTER TABLE meeting_meta ADD COLUMN transcript_path TEXT", []);
         Ok(())
     }
 
@@ -423,6 +425,29 @@ impl Store {
             .conn
             .query_row(
                 "SELECT playback_path FROM meeting_meta WHERE meeting_id = ?1",
+                params![meeting_id],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .optional()?
+            .flatten())
+    }
+
+    /// 逐字稿生成文件的绝对路径。
+    pub fn set_transcript_path(&self, meeting_id: i64, path: &str) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO meeting_meta (meeting_id, transcript_path, updated_at)
+             VALUES (?1, ?2, datetime('now'))
+             ON CONFLICT(meeting_id) DO UPDATE SET transcript_path = excluded.transcript_path, updated_at = datetime('now')",
+            params![meeting_id, path],
+        )?;
+        Ok(())
+    }
+
+    pub fn get_transcript_path(&self, meeting_id: i64) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT transcript_path FROM meeting_meta WHERE meeting_id = ?1",
                 params![meeting_id],
                 |r| r.get::<_, Option<String>>(0),
             )
@@ -638,6 +663,75 @@ impl Store {
             .conn
             .query_row("SELECT COUNT(*) FROM egress_log", [], |r| r.get(0))?)
     }
+
+    /// 聚合全局所有会议中出现过的参会人。
+    pub fn list_all_participants(&self) -> Result<Vec<ParticipantInfo>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT u.speaker_id,
+                    COUNT(DISTINCT u.meeting_id) as meeting_cnt,
+                    COUNT(u.id) as utt_cnt,
+                    MAX(m.started_at) as last_seen
+             FROM utterances u
+             JOIN meetings m ON u.meeting_id = m.id
+             GROUP BY u.speaker_id
+             ORDER BY last_seen DESC, utt_cnt DESC",
+        )?;
+
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as usize,
+                    r.get::<_, i64>(2)? as usize,
+                    r.get::<_, String>(3)?,
+                ))
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+
+        let mut list = Vec::new();
+        for (key, meeting_cnt, utt_cnt, last_seen) in rows {
+            let name_opt: Option<String> = self
+                .conn
+                .query_row(
+                    "SELECT display_name FROM speakers WHERE speaker_key = ?1 ORDER BY id DESC LIMIT 1",
+                    params![key],
+                    |r| r.get(0),
+                )
+                .optional()?;
+
+            let sample = self
+                .conn
+                .query_row(
+                    "SELECT text FROM utterances WHERE speaker_id = ?1 ORDER BY LENGTH(text) DESC LIMIT 1",
+                    params![key],
+                    |r| r.get::<_, String>(0),
+                )
+                .optional()?
+                .and_then(|enc| self.cipher.decrypt(&enc).ok())
+                .map(|t| t.chars().take(40).collect::<String>())
+                .unwrap_or_default();
+
+            list.push(ParticipantInfo {
+                key,
+                display_name: name_opt,
+                meeting_count: meeting_cnt,
+                utterance_count: utt_cnt,
+                sample,
+                last_seen,
+            });
+        }
+        Ok(list)
+    }
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ParticipantInfo {
+    pub key: String,
+    pub display_name: Option<String>,
+    pub meeting_count: usize,
+    pub utterance_count: usize,
+    pub sample: String,
+    pub last_seen: String,
 }
 
 #[cfg(test)]

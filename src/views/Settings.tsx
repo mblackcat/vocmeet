@@ -13,6 +13,7 @@ import type {
   SuggestedModel,
 } from "../types";
 import { formatBytes, formatTs } from "../types";
+import QuickNav from "../components/QuickNav";
 
 interface Props {
   onError: (msg: string) => void;
@@ -105,10 +106,13 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
   },
 ];
 
-/** 设置与自检合并在一页：都是「这台机器上的事」，没必要分成两个入口。 */
+const GAME_INDUSTRY_TERMS = [
+  "ASR", "NPC", "PVP", "PVE", "DAU", "MAU", "MMORPG", "GaaS", "UE5", "Unity",
+  "骨骼动画", "帧同步", "状态同步", "数值平衡", "次留", "ARPU", "物理引擎", "光追"
+];
+
 export default function Settings({ onError, onMeetingChanged }: Props) {
   const [cfg, setCfg] = useState<AppConfig | null>(null);
-  const [choices, setChoices] = useState<[string, string][]>([]);
   const [apiKey, setApiKey] = useState("");
   const [hasKey, setHasKey] = useState(false);
   const [audits, setAudits] = useState(0);
@@ -123,6 +127,7 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   const [suggested, setSuggested] = useState<SuggestedModel[]>([]);
   const [pulling, setPulling] = useState<PullEvent | null>(null);
   const [archivedList, setArchivedList] = useState<Meeting[]>([]);
+  const [newTerm, setNewTerm] = useState("");
 
   const loadArchived = async () => {
     try {
@@ -190,26 +195,22 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
         setFetching(null);
         setMsg(e.message);
         if (!e.ok) onError(e.message);
-        // 下完之后模型目录已经写回配置了，把两边都重新读一遍。
         void refreshDoctor();
         void api.getConfig().then(setCfg);
       })
       .then((f) => off.push(f));
     return () => off.forEach((f) => f());
-     
-  }, []);
+  }, [onError]);
 
   useEffect(() => {
     void (async () => {
       try {
-        const [c, l, k, a] = await Promise.all([
+        const [c, k, a] = await Promise.all([
           api.getConfig(),
-          api.egressPolicyLabels(),
           api.hasApiKey(),
           api.auditCount(),
         ]);
         setCfg(c);
-        setChoices(l);
         setHasKey(k);
         setAudits(a);
       } catch (e) {
@@ -227,7 +228,6 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
       } catch (e) {
         onError(asMessage(e));
       }
-      // 端点体检要真发一次请求，放最后，别拖慢整页。
       try {
         const [d, sug] = await Promise.all([api.diagnoseLlm(), api.suggestedLlmModels()]);
         setLlm(d);
@@ -239,7 +239,7 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
     })();
   }, [onError]);
 
-  if (!cfg) return <div className="hollow">读取中</div>;
+  if (!cfg) return <div className="hollow">读取中...</div>;
 
   const patch = (p: Partial<AppConfig>) => setCfg({ ...cfg, ...p });
 
@@ -283,13 +283,24 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
     }
   };
 
-  /** 已经有一套权重的话直接指过去，别再下一遍 360MB。 */
   const pickModelsDir = async () => {
     try {
       const dir = await open({ directory: true, multiple: false });
       if (typeof dir !== "string") return;
       setMsg(await api.setModelsDir(dir));
       await refreshDoctor();
+      setCfg(await api.getConfig());
+    } catch (e) {
+      onError(asMessage(e));
+    }
+  };
+
+  const pickTranscriptsDir = async () => {
+    try {
+      const dir = await open({ directory: true, multiple: false });
+      if (typeof dir !== "string") return;
+      const res = await api.setTranscriptsDir(dir);
+      setMsg(res);
       setCfg(await api.getConfig());
     } catch (e) {
       onError(asMessage(e));
@@ -325,384 +336,127 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
     void api.diagnoseLlm().then(setLlm).catch(() => {});
   };
 
+  const addTerm = (term: string) => {
+    const t = term.trim();
+    if (!t) return;
+    const existing = cfg.preset_terms || [];
+    if (existing.includes(t)) return;
+    const next = { ...cfg, preset_terms: [...existing, t] };
+    void persist(next);
+    setNewTerm("");
+  };
+
+  const removeTerm = (term: string) => {
+    const existing = cfg.preset_terms || [];
+    const next = { ...cfg, preset_terms: existing.filter((item) => item !== term) };
+    void persist(next);
+  };
+
+  const loadGamePresetTerms = () => {
+    const existing = new Set(cfg.preset_terms || []);
+    GAME_INDUSTRY_TERMS.forEach((t) => existing.add(t));
+    const next = { ...cfg, preset_terms: Array.from(existing) };
+    void persist(next);
+    setMsg("已载入游戏行业专用词汇库");
+  };
+
+  // 设置页面的快速导航项
+  const settingsNavItems = [
+    { id: "set-rec-asr", label: "录音与识别" },
+    { id: "set-transcripts", label: "逐字稿的来去" },
+    { id: "set-llm", label: "写纪要的模型" },
+    { id: "set-machine", label: "本机情况" },
+  ];
+
   return (
-    <div className="doc">
-      <div className="meeting-head">
-        <h2>设置</h2>
-        <span className="data">这台机器上的事</span>
-      </div>
-
-      {msg && <div className="msg">{msg}</div>}
-
-      <h2 className="section">逐字稿去哪里</h2>
-      {choices.map(([key, desc]) => (
-        <label className="choice" key={key}>
-          <input
-            type="radio"
-            checked={cfg.egress_policy === key}
-            onChange={() =>
-              void persist({ ...cfg, egress_policy: key as AppConfig["egress_policy"] })
-            }
-          />
-          <span>
-            <span className="c-t">{desc.split(" — ")[0]}</span>
-            <span className="c-d"> {desc.split(" — ")[1] ?? ""}</span>
-          </span>
-        </label>
-      ))}
-      {cfg.egress_policy === "open" && (
-        <div className="warn">
-          生成纪要时逐字稿全文会发送到你配置的服务商。原始录音始终留在本机；
-          说话人姓名会替换成「发言人A」这类代号再发出，生成后在本地换回真名。
+    <div className="doc-wrapper">
+      <div className="doc">
+        <div className="meeting-head" id="set-header">
+          <h2>设置</h2>
+          <span className="data">这台机器上的事</span>
         </div>
-      )}
-      <p className="note">已记录 {audits} 条出网记录，只有端点、模型和字符数，没有内容。</p>
 
-      <h2 className="section">写纪要的模型</h2>
+        {msg && <div className="msg">{msg}</div>}
 
-      <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "14px 0 16px" }}>
-        {PROVIDER_PRESETS.map((p) => {
-          const active =
-            (p.id === "ollama" && isLocalEndpoint(cfg.llm.api_base)) ||
-            (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
-            (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
-            (p.id === "openai" && cfg.llm.api_base.includes("openai.com"));
-          return (
-            <button
-              key={p.id}
-              className={`act ${active ? "on" : ""}`}
-              style={{
-                padding: "6px 14px",
-                background: active ? "var(--paper-2)" : "none",
-                borderColor: active ? "var(--ink)" : "var(--rule)",
-                fontWeight: active ? 400 : 300,
-              }}
-              onClick={() => void applyPreset(p)}
-              title={p.desc}
-            >
-              {p.name}
-            </button>
-          );
-        })}
-      </div>
+        {/* 1. 录音与识别 */}
+        <div id="set-rec-asr" className="section-block">
+          <h2 className="section">
+            <span className="section-title-tag">录音与识别</span>
+          </h2>
 
-      {!isLocalEndpoint(cfg.llm.api_base) && cfg.egress_policy === "local_only" && (
-        <div className="warn" style={{ display: "flex", justifyContent: "space-between", alignItems: "center" }}>
-          <span>
-            当前配置为远端服务地址，但出网策略限制为「仅本地端点」，会导致连接测试与纪要生成被拦截。
-          </span>
-          <button
-            className="act"
-            style={{ marginLeft: 16, whiteSpace: "nowrap", padding: "4px 10px" }}
-            onClick={() => void persist({ ...cfg, egress_policy: "open" })}
-          >
-            一键切换为允许出网
-          </button>
-        </div>
-      )}
+          {/* 语音识别模型（挪到第一部分） */}
+          <div className="subsection-title">语音识别模型</div>
+          <p className="note" style={{ marginTop: 0, marginBottom: 12 }}>
+            语音识别模型不随安装包提供，需手动下载安装。首次下载默认存放于应用内的 models 目录。
+          </p>
 
-      <div className="set-row">
-        <span className="k">服务地址</span>
-        <span className="v">
-          <input
-            type="text"
-            value={cfg.llm.api_base}
-            placeholder="http://localhost:11434/v1 或 https://generativelanguage.googleapis.com/v1beta/openai"
-            onChange={(e) => patch({ llm: { ...cfg.llm, api_base: e.target.value } })}
-            onBlur={() => void persist(cfg)}
-          />
-          <div className="note">
-            {isLocalEndpoint(cfg.llm.api_base)
-              ? "当前为本地端点（Ollama / vLLM / llama.cpp）"
-              : "当前为远端端点（标准 OpenAI 兼容协议）"}
-          </div>
-        </span>
-      </div>
-      <div className="set-row">
-        <span className="k">模型</span>
-        <span className="v">
-          <input
-            type="text"
-            list="llm-models"
-            value={cfg.llm.model}
-            onChange={(e) => patch({ llm: { ...cfg.llm, model: e.target.value } })}
-            onBlur={() => void persist(cfg)}
-          />
-          <datalist id="llm-models">
-            {(llm?.installed ?? []).map((m) => (
-              <option value={m} key={m} />
-            ))}
-          </datalist>
-
-          {(() => {
-            const currentPreset = PROVIDER_PRESETS.find(
-              (p) =>
-                (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
-                (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
-                (p.id === "openai" && cfg.llm.api_base.includes("openai.com")) ||
-                (p.id === "ollama" && isLocalEndpoint(cfg.llm.api_base)),
-            );
-            if (!currentPreset || currentPreset.candidateModels.length === 0) return null;
-            return (
-              <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap", alignItems: "baseline" }}>
-                <span className="note" style={{ marginTop: 0 }}>快捷填入：</span>
-                {currentPreset.candidateModels.map((m) => (
-                  <button
-                    key={m}
-                    className="link"
-                    style={{
-                      fontSize: 12,
-                      color: cfg.llm.model === m ? "var(--ink)" : "var(--ink-3)",
-                      textDecoration: cfg.llm.model === m ? "underline" : "none",
-                      fontWeight: cfg.llm.model === m ? 500 : 300,
-                      cursor: "pointer",
-                      border: 0,
-                      background: "none",
-                      padding: "1px 4px",
-                    }}
-                    onClick={() => {
-                      patch({ llm: { ...cfg.llm, model: m } });
-                      void persist({ ...cfg, llm: { ...cfg.llm, model: m } });
-                    }}
-                  >
-                    {m}
-                  </button>
-                ))}
+          {report && (
+            <>
+              <div className="check">
+                <span className={report.models_ok ? "st ok" : "st no"}>
+                  {report.models_ok ? "就绪" : "缺失"}
+                </span>
+                <span className="d">
+                  识别模型{" "}
+                  {report.models_ok
+                    ? `· 占用空间 ${report.total_model_mb.toFixed(1)} MB`
+                    : report.models_message.split(String.fromCharCode(10))[0]}
+                  <div className="note">路径：{report.models_dir}</div>
+                </span>
               </div>
-            );
-          })()}
 
-          {llm && (
-            <div className="note">
-              {llm.installed.length > 0
-                ? `端点返回可用模型：${llm.installed.join("、")}`
-                : isLocalEndpoint(cfg.llm.api_base)
-                  ? "端点上还没有任何模型"
-                  : "远端服务未返回清单或已通过直接调用测试"}
-            </div>
-          )}
-        </span>
-      </div>
-      {llm && (
-        <div className="check">
-          <span className={llm.reachable && llm.model_present ? "st ok" : "st no"}>
-            {llm.reachable ? (llm.model_present ? "就绪" : "缺模型") : "连不上"}
-          </span>
-          <span className="d">
-            {llm.message}
-            {llm.hint && <div className="note">{llm.hint}</div>}
-          </span>
-        </div>
-      )}
-
-      {isLocalEndpoint(cfg.llm.api_base) &&
-        (pulling ? (
-          <div className="fetching">
-            {pulling.total ? (
-              <div className="thin-bar" style={{ width: "100%", marginTop: 0 }}>
-                <div
-                  className="fill"
-                  style={{
-                    width: `${Math.round(((pulling.completed ?? 0) / pulling.total) * 100)}%`,
-                  }}
-                />
-              </div>
-            ) : null}
-            <p className="data">
-              {pulling.status}
-              {pulling.total
-                ? ` · ${formatBytes(pulling.completed ?? 0)} / ${formatBytes(pulling.total)}`
-                : ""}
-            </p>
-            <p className="note" style={{ marginTop: 0 }}>
-              由 Ollama 自己在下，关掉这一页也不会中断。
-            </p>
-          </div>
-        ) : (
-          llm?.reachable &&
-          !llm.model_present && (
-            <div className="fetching">
-              <p className="note" style={{ marginTop: 0 }}>
-                让 Ollama 直接拉一个，下完自动切过去：
-              </p>
-              <div className="actions" style={{ marginTop: 10, borderTop: 0, paddingTop: 0 }}>
-                {suggested.map(([name, desc]) => (
-                  <button
-                    className="act"
-                    key={name}
-                    title={desc}
-                    onClick={() => void api.pullLlmModel(name)}
-                  >
-                    拉取 {name}
-                  </button>
-                ))}
-              </div>
-              {suggested.map(([name, desc]) => (
-                <div className="note" key={name}>
-                  {name} — {desc}
-                </div>
-              ))}
-            </div>
-          )
-        ))}
-
-      <div className="set-row">
-        <span className="k">上下文长度</span>
-        <span className="v">
-          <input
-            type="number"
-            value={cfg.llm.context_tokens}
-            onChange={(e) =>
-              patch({ llm: { ...cfg.llm, context_tokens: Number(e.target.value) } })
-            }
-            onBlur={() => void persist(cfg)}
-          />
-          <div className="note">
-            长会议超出一半时会自动分段提要再合成（本地模型建议 16384，Gemini 等云端长文本模型建议 65536）
-          </div>
-        </span>
-      </div>
-      <div className="set-row">
-        <span className="k">API 密钥</span>
-        <span className="v">
-          <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
-            <input
-              type="password"
-              value={apiKey}
-              placeholder={hasKey ? "已保存，留空则不改动" : "远端模型填写 API Token (如 AIzaSy...)"}
-              onChange={(e) => setApiKey(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter" && apiKey.trim()) void storeKey();
-              }}
-              style={{ flex: 1 }}
-            />
-            <button
-              className="act"
-              disabled={!apiKey.trim()}
-              onClick={() => void storeKey()}
-              style={{ margin: 0, padding: "5px 12px", whiteSpace: "nowrap" }}
-            >
-              保存密钥
-            </button>
-          </div>
-          <div className="note">
-            {hasKey ? "系统凭据管理器已存有密钥。" : "尚未存储密钥。"}
-            {(() => {
-              const currentPreset = PROVIDER_PRESETS.find(
-                (p) =>
-                  (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
-                  (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
-                  (p.id === "openai" && cfg.llm.api_base.includes("openai.com")),
-              );
-              return currentPreset ? ` ${currentPreset.keyHint}` : " 远端服务使用 Bearer 认证";
-            })()}
-          </div>
-        </span>
-      </div>
-      <div className="actions" style={{ marginTop: 20, borderTop: 0, paddingTop: 0 }}>
-        <button className="act" disabled={testing} onClick={() => void test()}>
-          {testing ? "连接中" : "测试连接"}
-        </button>
-        <button className="act" disabled={probing} onClick={() => void probe()}>
-          {probing ? "检查中" : "重新检查端点"}
-        </button>
-      </div>
-
-      <h2 className="section">录音与识别</h2>
-      <div className="set-row">
-        <span className="k">识别线程</span>
-        <span className="v">
-          <input
-            type="number"
-            value={cfg.engine.num_threads}
-            onChange={(e) =>
-              patch({ engine: { ...cfg.engine, num_threads: Number(e.target.value) } })
-            }
-            onBlur={() => void persist(cfg)}
-          />
-        </span>
-      </div>
-      <div className="set-row">
-        <span className="k">分片时长</span>
-        <span className="v">
-          <input
-            type="number"
-            value={cfg.capture.chunk_seconds}
-            onChange={(e) =>
-              patch({ capture: { ...cfg.capture, chunk_seconds: Number(e.target.value) } })
-            }
-            onBlur={() => void persist(cfg)}
-          />
-          <div className="note">每隔这么久落一次盘，断电最多丢这么多</div>
-        </span>
-      </div>
-
-      <h2 className="section">这台机器</h2>
-      {report && (
-        <>
-          <div className="check">
-            <span className={report.models_ok ? "st ok" : "st no"}>
-              {report.models_ok ? "就绪" : "缺失"}
-            </span>
-            <span className="d">
-              识别模型{" "}
-              {report.models_ok
-                ? `${report.total_model_mb.toFixed(0)} MB`
-                : report.models_message.split(String.fromCharCode(10))[0]}
-              <div className="note">{report.models_dir}</div>
-            </span>
-          </div>
-
-          {fetching ? (
-            <div className="fetching">
-              <div className="thin-bar" style={{ width: "100%", marginTop: 0 }}>
-                <div className="fill" style={{ width: `${Math.round(fetching.overall * 100)}%` }} />
-              </div>
-              <p className="data">
-                {fetching.label} · {phaseText(fetching.phase)}
-                {fetching.phase === "downloading" &&
-                  ` ${formatBytes(fetching.received)}${
-                    fetching.total ? ` / ${formatBytes(fetching.total)}` : ""
-                  }`}
-                {` · 第 ${fetching.index + 1}/${fetching.total_assets} 项`}
-              </p>
-              <button className="act" onClick={() => void api.cancelModelDownload()}>
-                取消下载
-              </button>
-            </div>
-          ) : (
-            !report.models_ok &&
-            plan && (
-              <div className="fetching">
-                <p className="note" style={{ marginTop: 0 }}>
-                  会从 GitHub 下载 {formatBytes(plan.total_bytes)}（{plan.assets.join("、")}），
-                  存到 {plan.models_dir}，下完自动生效。这是唯一一次需要联网的步骤。
-                </p>
-                <div className="actions" style={{ marginTop: 12, borderTop: 0, paddingTop: 0 }}>
-                  <button className="act" onClick={() => void api.downloadModels()}>
-                    一键下载模型
-                  </button>
-                  <button className="act" onClick={() => void pickModelsDir()}>
-                    已经有了，指个目录
+              {fetching ? (
+                <div className="fetching">
+                  <div className="thin-bar" style={{ width: "100%", marginTop: 0 }}>
+                    <div className="fill" style={{ width: `${Math.round(fetching.overall * 100)}%` }} />
+                  </div>
+                  <p className="data">
+                    {fetching.label} · {phaseText(fetching.phase)}
+                    {fetching.phase === "downloading" &&
+                      ` ${formatBytes(fetching.received)}${
+                        fetching.total ? ` / ${formatBytes(fetching.total)}` : ""
+                      }`}
+                    {` · 第 ${fetching.index + 1}/${fetching.total_assets} 项`}
+                  </p>
+                  <button className="act" onClick={() => void api.cancelModelDownload()}>
+                    取消下载
                   </button>
                 </div>
-              </div>
-            )
+              ) : (
+                !report.models_ok &&
+                plan && (
+                  <div className="fetching">
+                    <p className="note" style={{ marginTop: 0 }}>
+                      会从 GitHub 下载约 {formatBytes(plan.total_bytes)}（包含 VAD 静音切分与声纹特征提取权重），
+                      存放至 {plan.models_dir}，下载完成后自动就绪生效。
+                    </p>
+                    <div className="actions" style={{ marginTop: 12, borderTop: 0, paddingTop: 0 }}>
+                      <button className="act" onClick={() => void api.downloadModels()}>
+                        一键下载模型
+                      </button>
+                      <button className="act" onClick={() => void pickModelsDir()}>
+                        已有模型，指个目录
+                      </button>
+                    </div>
+                  </div>
+                )
+              )}
+            </>
           )}
-          <div className="check">
-            <span className={report.db_ok ? "st ok" : "st no"}>
-              {report.db_ok ? "正常" : "异常"}
-            </span>
-            <span className="d">本地数据库与凭据管理器 · {report.db_message}</span>
-          </div>
-          <div className="check">
-            <span className={report.loopback_ok ? "st ok" : "st no"}>
-              {report.loopback_ok ? "可用" : "不可用"}
-            </span>
-            <span className="d">
-              录制系统声音{report.loopback_ok ? "" : ` · ${report.loopback_message}`}
-            </span>
-          </div>
+
+          {/* 录音装置字段与提示（从本机情况挪过来） */}
+          <div className="subsection-title" style={{ marginTop: 24 }}>录音装置</div>
+          {report && (
+            <div className="check">
+              <span className={report.loopback_ok ? "st ok" : "st no"}>
+                {report.loopback_ok ? "可用" : "不可用"}
+              </span>
+              <span className="d">
+                系统回环内录（捕捉远端/会议软件发声）
+                {report.loopback_ok ? "" : ` · ${report.loopback_message}`}
+              </span>
+            </div>
+          )}
           {devices.map((dev, i) => (
             <div className="check" key={i}>
               <span className="st">{dev.direction}</span>
@@ -712,52 +466,458 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
               </span>
             </div>
           ))}
-          <p className="note">数据存放在 {report.data_dir}</p>
-        </>
-      )}
 
-      <h2 className="section">已归档会议 ({archivedList.length})</h2>
-      <p className="note" style={{ marginTop: 0 }}>
-        归档的会议会从侧边栏主列表中隐藏，所有录音、逐字稿与纪要数据完整保留。
-      </p>
-      {archivedList.length === 0 ? (
-        <div className="note" style={{ padding: "10px 0" }}>
-          暂无已归档的会议。在侧边栏会议记录上右键选择「归档会议」即可收纳至此。
+          {/* 识别引擎与分片参数 */}
+          <div className="subsection-title" style={{ marginTop: 24 }}>参数调优</div>
+          <div className="set-row">
+            <span className="k">识别线程</span>
+            <span className="v">
+              <input
+                type="number"
+                value={cfg.engine.num_threads}
+                onChange={(e) =>
+                  patch({ engine: { ...cfg.engine, num_threads: Number(e.target.value) } })
+                }
+                onBlur={() => void persist(cfg)}
+              />
+              <div className="note">CPU 推理核心数，建议保持为物理核心数的 1/2 至 1 倍</div>
+            </span>
+          </div>
+          <div className="set-row">
+            <span className="k">分片时长 (秒)</span>
+            <span className="v">
+              <input
+                type="number"
+                value={cfg.capture.chunk_seconds}
+                onChange={(e) =>
+                  patch({ capture: { ...cfg.capture, chunk_seconds: Number(e.target.value) } })
+                }
+                onBlur={() => void persist(cfg)}
+              />
+              <div className="note">每隔指定秒数音频自动落盘一次，断电或异常最多损失一个分片</div>
+            </span>
+          </div>
         </div>
-      ) : (
-        <div className="archived-list">
-          {archivedList.map((m) => (
-            <div className="archived-item" key={m.id}>
-              <div className="archived-info">
-                <div className="archived-title" title={m.title}>
-                  {m.title}
-                </div>
-                <div className="archived-meta data">
-                  {m.started_at.slice(0, 16).replace("T", " ")} · {formatTs(m.duration_ms)}
-                </div>
-              </div>
-              <div className="archived-actions">
+
+        {/* 2. 逐字稿的来去（落盘目录修改，移除原有仅本机和任意端点单选项） */}
+        <div id="set-transcripts" className="section-block">
+          <h2 className="section">
+            <span className="section-title-tag">逐字稿的来去</span>
+          </h2>
+
+          <div className="set-row">
+            <span className="k">逐字稿落盘目录</span>
+            <span className="v">
+              <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
+                <input
+                  type="text"
+                  readOnly
+                  value={cfg.transcripts_dir || `${cfg.data_dir}\\transcripts`}
+                  style={{ flex: 1, color: "var(--ink)" }}
+                />
                 <button
+                  type="button"
                   className="act"
-                  style={{ padding: "4px 10px", fontSize: 12 }}
-                  onClick={() => void handleRestore(m.id, m.title)}
-                  title="恢复到侧边栏主列表"
+                  style={{ margin: 0, padding: "5px 12px", whiteSpace: "nowrap" }}
+                  onClick={() => void pickTranscriptsDir()}
                 >
-                  恢复
-                </button>
-                <button
-                  className="act"
-                  style={{ padding: "4px 10px", fontSize: 12, color: "var(--live)" }}
-                  onClick={() => void handleDelete(m.id, m.title)}
-                  title="彻底删除并清理磁盘数据"
-                >
-                  彻底删除
+                  修改目录
                 </button>
               </div>
+              <div className="note">
+                会议识别完成后的逐字稿 Markdown 文件将自动输出至此目录。修改落盘目录不影响已有旧文稿（每场会议记录均绑定生成时的绝对地址）。
+              </div>
+            </span>
+          </div>
+
+          <div className="set-row">
+            <span className="k">出网审计</span>
+            <span className="v">
+              <span className="data">已记录 {audits} 次模型调用审计</span>
+              <div className="note">
+                审计仅记录端点、模型名称和发送字符数，不存储任何会议发言正文。
+              </div>
+            </span>
+          </div>
+        </div>
+
+        {/* 3. 写纪要的模型（API密钥挪到模型后、就绪提示前，增加预设信息） */}
+        <div id="set-llm" className="section-block">
+          <h2 className="section">
+            <span className="section-title-tag">写纪要的模型</span>
+          </h2>
+
+          {/* 预设服务商按钮 */}
+          <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "14px 0 16px" }}>
+            {PROVIDER_PRESETS.map((p) => {
+              const active =
+                (p.id === "ollama" && isLocalEndpoint(cfg.llm.api_base)) ||
+                (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
+                (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
+                (p.id === "openai" && cfg.llm.api_base.includes("openai.com"));
+              return (
+                <button
+                  key={p.id}
+                  className={`act ${active ? "on" : ""}`}
+                  style={{
+                    padding: "6px 14px",
+                    background: active ? "var(--paper-2)" : "none",
+                    borderColor: active ? "var(--ink)" : "var(--rule)",
+                    fontWeight: active ? 400 : 300,
+                  }}
+                  onClick={() => void applyPreset(p)}
+                  title={p.desc}
+                >
+                  {p.name}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* 服务地址 */}
+          <div className="set-row">
+            <span className="k">服务地址</span>
+            <span className="v">
+              <input
+                type="text"
+                value={cfg.llm.api_base}
+                placeholder="http://localhost:11434/v1 或 https://api.deepseek.com/v1"
+                onChange={(e) => patch({ llm: { ...cfg.llm, api_base: e.target.value } })}
+                onBlur={() => void persist(cfg)}
+              />
+              <div className="note">
+                {isLocalEndpoint(cfg.llm.api_base)
+                  ? "当前为本地端点（Ollama / vLLM / llama.cpp）"
+                  : "当前为远端端点（标准 OpenAI 兼容协议）"}
+              </div>
+            </span>
+          </div>
+
+          {/* 模型名称 */}
+          <div className="set-row">
+            <span className="k">模型</span>
+            <span className="v">
+              <input
+                type="text"
+                list="llm-models"
+                value={cfg.llm.model}
+                onChange={(e) => patch({ llm: { ...cfg.llm, model: e.target.value } })}
+                onBlur={() => void persist(cfg)}
+              />
+              <datalist id="llm-models">
+                {(llm?.installed ?? []).map((m) => (
+                  <option value={m} key={m} />
+                ))}
+              </datalist>
+
+              {(() => {
+                const currentPreset = PROVIDER_PRESETS.find(
+                  (p) =>
+                    (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
+                    (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
+                    (p.id === "openai" && cfg.llm.api_base.includes("openai.com")) ||
+                    (p.id === "ollama" && isLocalEndpoint(cfg.llm.api_base)),
+                );
+                if (!currentPreset || currentPreset.candidateModels.length === 0) return null;
+                return (
+                  <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap", alignItems: "baseline" }}>
+                    <span className="note" style={{ marginTop: 0 }}>快捷填入：</span>
+                    {currentPreset.candidateModels.map((m) => (
+                      <button
+                        key={m}
+                        className="link"
+                        style={{
+                          fontSize: 12,
+                          color: cfg.llm.model === m ? "var(--ink)" : "var(--ink-3)",
+                          textDecoration: cfg.llm.model === m ? "underline" : "none",
+                          fontWeight: cfg.llm.model === m ? 500 : 300,
+                          cursor: "pointer",
+                          border: 0,
+                          background: "none",
+                          padding: "1px 4px",
+                        }}
+                        onClick={() => {
+                          patch({ llm: { ...cfg.llm, model: m } });
+                          void persist({ ...cfg, llm: { ...cfg.llm, model: m } });
+                        }}
+                      >
+                        {m}
+                      </button>
+                    ))}
+                  </div>
+                );
+              })()}
+            </span>
+          </div>
+
+          {/* API密钥（挪到模型字段后，在就绪提示前） */}
+          <div className="set-row">
+            <span className="k">API 密钥</span>
+            <span className="v">
+              <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                <input
+                  type="password"
+                  value={apiKey}
+                  placeholder={hasKey ? "已在系统凭据库保存，留空则不修改" : "远端模型填写 API Token (如 AIzaSy... / sk-...)"}
+                  onChange={(e) => setApiKey(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter" && apiKey.trim()) void storeKey();
+                  }}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  type="button"
+                  className="act"
+                  disabled={!apiKey.trim()}
+                  onClick={() => void storeKey()}
+                  style={{ margin: 0, padding: "5px 12px", whiteSpace: "nowrap" }}
+                >
+                  保存密钥
+                </button>
+              </div>
+              <div className="note">
+                {hasKey ? "凭据管理器已存有密钥。" : "尚未存储密钥。"}
+                {(() => {
+                  const currentPreset = PROVIDER_PRESETS.find(
+                    (p) =>
+                      (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
+                      (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
+                      (p.id === "openai" && cfg.llm.api_base.includes("openai.com")),
+                  );
+                  return currentPreset ? ` ${currentPreset.keyHint}` : " 远端兼容服务使用 Bearer Token 认证。";
+                })()}
+              </div>
+            </span>
+          </div>
+
+          {/* 就绪检查提示卡片（在密钥之后） */}
+          {llm && (
+            <div className="check" style={{ marginTop: 14 }}>
+              <span className={llm.reachable && llm.model_present ? "st ok" : "st no"}>
+                {llm.reachable ? (llm.model_present ? "就绪" : "缺模型") : "连不上"}
+              </span>
+              <span className="d">
+                {llm.message}
+                {llm.hint && <div className="note">{llm.hint}</div>}
+              </span>
             </div>
-          ))}
+          )}
+
+          {/* 本地端点拉取模型 */}
+          {isLocalEndpoint(cfg.llm.api_base) &&
+            (pulling ? (
+              <div className="fetching">
+                {pulling.total ? (
+                  <div className="thin-bar" style={{ width: "100%", marginTop: 0 }}>
+                    <div
+                      className="fill"
+                      style={{
+                        width: `${Math.round(((pulling.completed ?? 0) / pulling.total) * 100)}%`,
+                      }}
+                    />
+                  </div>
+                ) : null}
+                <p className="data">
+                  {pulling.status}
+                  {pulling.total
+                    ? ` · ${formatBytes(pulling.completed ?? 0)} / ${formatBytes(pulling.total)}`
+                    : ""}
+                </p>
+                <p className="note" style={{ marginTop: 0 }}>
+                  由 Ollama 自身后台下载，切换界面不会中断。
+                </p>
+              </div>
+            ) : (
+              llm?.reachable &&
+              !llm.model_present && (
+                <div className="fetching">
+                  <p className="note" style={{ marginTop: 0 }}>
+                    让本地 Ollama 自动拉取模型，完成后切入使用：
+                  </p>
+                  <div className="actions" style={{ marginTop: 10, borderTop: 0, paddingTop: 0 }}>
+                    {suggested.map(([name, desc]) => (
+                      <button
+                        className="act"
+                        key={name}
+                        title={desc}
+                        onClick={() => void api.pullLlmModel(name)}
+                      >
+                        拉取 {name}
+                      </button>
+                    ))}
+                  </div>
+                </div>
+              )
+            ))}
+
+          <div className="actions" style={{ marginTop: 16, borderTop: 0, paddingTop: 0 }}>
+            <button type="button" className="act" disabled={testing} onClick={() => void test()}>
+              {testing ? "连接中..." : "测试连接"}
+            </button>
+            <button type="button" className="act" disabled={probing} onClick={() => void probe()}>
+              {probing ? "检查中..." : "重新检查端点"}
+            </button>
+          </div>
+
+          <div className="set-row">
+            <span className="k">上下文长度</span>
+            <span className="v">
+              <input
+                type="number"
+                value={cfg.llm.context_tokens}
+                onChange={(e) =>
+                  patch({ llm: { ...cfg.llm, context_tokens: Number(e.target.value) } })
+                }
+                onBlur={() => void persist(cfg)}
+              />
+              <div className="note">
+                长会议超出上限时自动进行分段提要再合成（本地模型建议 16384，云端长文本建议 65536）。
+              </div>
+            </span>
+          </div>
+
+          {/* 新增预设信息模块：行业专用词与系统提示词管理 */}
+          <div className="subsection-title" style={{ marginTop: 28 }}>预设信息与专用词库</div>
+          <p className="note" style={{ marginTop: 0, marginBottom: 14 }}>
+            预先设定行业术语词汇与提示词补充指令，可显著提升语音识别纠错与纪要提炼的专业准确度。
+          </p>
+
+          <div className="set-row">
+            <span className="k">行业专用词库</span>
+            <span className="v">
+              <div className="preset-terms-wrap">
+                {(cfg.preset_terms || []).map((term) => (
+                  <span className="preset-term-chip" key={term}>
+                    <span>{term}</span>
+                    <button
+                      type="button"
+                      className="term-del-btn"
+                      onClick={() => removeTerm(term)}
+                      aria-label={`删除词 ${term}`}
+                    >
+                      ×
+                    </button>
+                  </span>
+                ))}
+              </div>
+
+              <div style={{ display: "flex", gap: 8, marginTop: 10, alignItems: "center" }}>
+                <input
+                  type="text"
+                  value={newTerm}
+                  placeholder="输入术语/缩写（如 UE5、DAU、帧同步），回车添加"
+                  onChange={(e) => setNewTerm(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === "Enter") addTerm(newTerm);
+                  }}
+                  style={{ flex: 1 }}
+                />
+                <button
+                  type="button"
+                  className="act"
+                  style={{ margin: 0, padding: "5px 12px" }}
+                  onClick={() => addTerm(newTerm)}
+                >
+                  添加词
+                </button>
+                <button
+                  type="button"
+                  className="act"
+                  style={{ margin: 0, padding: "5px 12px", fontSize: 12 }}
+                  title="填入游戏行业常用词（ASR/NPC/PVP/PVE/DAU/MAU/MMO/GaaS/骨骼动画等）"
+                  onClick={loadGamePresetTerms}
+                >
+                  载入游戏行业常用词
+                </button>
+              </div>
+            </span>
+          </div>
+
+          <div className="set-row">
+            <span className="k">系统补充提示词</span>
+            <span className="v">
+              <textarea
+                rows={3}
+                className="preset-prompt-input"
+                value={cfg.preset_prompt || ""}
+                placeholder="例如：优先使用分点条列；重点标记 Action Items 和责任人；行业术语保持英文缩写不翻译..."
+                onChange={(e) => patch({ preset_prompt: e.target.value })}
+                onBlur={() => void persist(cfg)}
+              />
+              <div className="note">在生成会议纪要时，作为核心指令补充给 LLM 模型。</div>
+            </span>
+          </div>
         </div>
-      )}
+
+        {/* 4. 本机情况 */}
+        <div id="set-machine" className="section-block">
+          <h2 className="section">
+            <span className="section-title-tag">本机情况</span>
+          </h2>
+
+          {report && (
+            <>
+              <div className="check">
+                <span className={report.db_ok ? "st ok" : "st no"}>
+                  {report.db_ok ? "正常" : "异常"}
+                </span>
+                <span className="d">本地数据库与凭据管理器 · {report.db_message}</span>
+              </div>
+              <p className="note">数据主目录：{report.data_dir}</p>
+            </>
+          )}
+
+          {/* 归档会议管理 */}
+          <div className="subsection-title" style={{ marginTop: 24 }}>
+            已归档会议 ({archivedList.length})
+          </div>
+          <p className="note" style={{ marginTop: 0 }}>
+            归档会议已从主列表收起，所有录音、逐字稿与纪要数据完整留存。
+          </p>
+
+          {archivedList.length === 0 ? (
+            <div className="note" style={{ padding: "8px 0" }}>
+              暂无已归档的会议。在侧边栏会议上右键选择「归档会议」即可放入此库。
+            </div>
+          ) : (
+            <div className="archived-list">
+              {archivedList.map((m) => (
+                <div className="archived-item" key={m.id}>
+                  <div className="archived-info">
+                    <div className="archived-title" title={m.title}>
+                      {m.title}
+                    </div>
+                    <div className="archived-meta data">
+                      {m.started_at.slice(0, 16).replace("T", " ")} · {formatTs(m.duration_ms)}
+                    </div>
+                  </div>
+                  <div className="archived-actions">
+                    <button
+                      className="act"
+                      style={{ padding: "4px 10px", fontSize: 12 }}
+                      onClick={() => void handleRestore(m.id, m.title)}
+                      title="恢复到侧边栏主列表"
+                    >
+                      恢复
+                    </button>
+                    <button
+                      className="act"
+                      style={{ padding: "4px 10px", fontSize: 12, color: "var(--live)" }}
+                      onClick={() => void handleDelete(m.id, m.title)}
+                      title="彻底删除并清理磁盘数据"
+                    >
+                      彻底删除
+                    </button>
+                  </div>
+                </div>
+              ))}
+            </div>
+          )}
+        </div>
+      </div>
+
+      {/* 右侧固定的快速导航 */}
+      <QuickNav items={settingsNavItems} />
     </div>
   );
 }

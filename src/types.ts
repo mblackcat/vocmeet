@@ -68,6 +68,7 @@ export interface MeetingDetail {
   attendees: string[];
   summary: string | null;
   playback_path: string | null;
+  transcript_path?: string | null;
   utterance_count: number;
   note: string;
 }
@@ -136,10 +137,22 @@ export interface AppConfig {
   data_dir: string;
   models_dir: string;
   templates_dir: string;
+  transcripts_dir?: string;
+  preset_terms?: string[];
+  preset_prompt?: string;
   egress_policy: "local_only" | "open";
   llm: LlmConfig;
   engine: EngineConfig;
   capture: CaptureConfig;
+}
+
+export interface ParticipantInfo {
+  key: string;
+  display_name: string | null;
+  meeting_count: number;
+  utterance_count: number;
+  sample: string;
+  last_seen: string;
 }
 
 export interface ModelPlan {

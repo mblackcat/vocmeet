@@ -4,6 +4,9 @@ import { save } from "@tauri-apps/plugin-dialog";
 import { api, asMessage, events } from "../api";
 import type { MeetingDetail, ProcessEvent, SpeakerRow, Utterance } from "../types";
 import { formatTs } from "../types";
+import MarkdownRenderer from "../components/MarkdownRenderer";
+import AttendeesFold from "../components/AttendeesFold";
+import QuickNav from "../components/QuickNav";
 
 const NL = String.fromCharCode(10);
 
@@ -15,7 +18,6 @@ interface Props {
   onBusy: (id: number) => void;
 }
 
-/** 一场已完成的会议：先听，再读，最后带走。 */
 export default function MeetingView({ meetingId, onError, onChanged, onBusy }: Props) {
   const [d, setD] = useState<MeetingDetail | null>(null);
   const [utterances, setUtterances] = useState<Utterance[]>([]);
@@ -26,34 +28,61 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
   const [dur, setDur] = useState(0);
   const [hasAudio, setHasAudio] = useState(false);
   const [step, setStep] = useState<ProcessEvent | null>(null);
-  /** 参会人数。空 = 让聚类自己估，但阈值 0.5 偏低会过分裂，长会议尤其明显。 */
-  const [speakers2, setSpeakers2] = useState("");
-  const audio = useRef<HTMLAudioElement>(null);
+  const [notesOpen, setNotesOpen] = useState(true);
+  const [transcriptOpen, setTranscriptOpen] = useState(true);
 
-  const load = useCallback(async () => {
+  const audio = useRef<HTMLAudioElement>(null);
+  const curMeetingIdRef = useRef<number>(meetingId);
+  curMeetingIdRef.current = meetingId;
+
+  // 避免切换会议时的旧数据残留与异步竞态（修复串会Bug）
+  const load = useCallback(async (targetId: number) => {
     try {
-      const detail = await api.getMeetingDetail(meetingId);
+      const detail = await api.getMeetingDetail(targetId);
+      if (curMeetingIdRef.current !== targetId) return;
       setD(detail);
+
       if (detail.utterance_count > 0) {
         const [u, s] = await Promise.all([
-          api.getTranscript(meetingId),
-          api.listSpeakers(meetingId),
+          api.getTranscript(targetId),
+          api.listSpeakers(targetId),
         ]);
+        if (curMeetingIdRef.current !== targetId) return;
         setUtterances(u);
         setSpeakers(s);
         setNames(Object.fromEntries(s.map((r) => [r.key, r.display_name ?? ""])));
+      } else {
+        setUtterances([]);
+        setSpeakers([]);
+        setNames({});
       }
     } catch (e) {
-      onError(asMessage(e));
+      if (curMeetingIdRef.current === targetId) {
+        onError(asMessage(e));
+      }
     }
-  }, [meetingId, onError]);
+  }, [onError]);
 
   useEffect(() => {
-    void load();
-    void api.meetingHasAudio(meetingId).then(setHasAudio).catch(() => setHasAudio(false));
-  }, [load, meetingId]);
+    // 切换会议时立即清理前一场会议的状态，杜绝串会
+    setD(null);
+    setUtterances([]);
+    setSpeakers([]);
+    setNames({});
+    setStep(null);
+    setPlaying(false);
+    setAt(0);
+    setDur(0);
 
-  // 重整的进度事件是全局的，只认自己这一场。
+    void load(meetingId);
+    void api.meetingHasAudio(meetingId).then((has) => {
+      if (curMeetingIdRef.current === meetingId) setHasAudio(has);
+    }).catch(() => {
+      if (curMeetingIdRef.current === meetingId) setHasAudio(false);
+    });
+  }, [meetingId, load]);
+
+  // 重整的进度事件是全局的，只认自己这一场
   useEffect(() => {
     const off: Array<() => void> = [];
     void events
@@ -66,14 +95,14 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
         if (e.meeting_id !== meetingId) return;
         setStep(null);
         if (e.phase === "failed") onError(e.detail);
-        void load();
+        void load(meetingId);
         onChanged();
       })
       .then((f) => off.push(f));
     return () => off.forEach((f) => f());
   }, [meetingId, load, onChanged, onError]);
 
-  if (!d) return <div className="hollow">读取中</div>;
+  if (!d) return <div className="hollow">读取中...</div>;
 
   const src = d.playback_path ? convertFileSrc(d.playback_path) : null;
 
@@ -101,7 +130,7 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
     if (!v) return;
     try {
       await api.nameSpeaker(meetingId, key, v);
-      await load();
+      await load(meetingId);
       onChanged();
     } catch (e) {
       onError(asMessage(e));
@@ -110,15 +139,12 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
 
   /**
    * 重新整理。
-   *
-   * `full` 从盘上的录音重跑识别与纪要，`summary` 只重写纪要。
-   * 两种都按**点下去这一刻**的配置来：换了模型再点一次，就是换个模型重写。
+   * mode: "full" 从盘上的录音重跑识别；"summary" 只重写纪要。
+   * 参会人数量参数彻底移除，按自动解析逻辑走。
    */
   const reprocess = async (mode: "full" | "summary") => {
-    const n = Number(speakers2);
-    const known = mode === "full" && Number.isInteger(n) && n > 0 ? n : null;
     try {
-      await api.reprocessMeeting(meetingId, mode, known);
+      await api.reprocessMeeting(meetingId, mode, null);
       onBusy(meetingId);
       setStep({
         meeting_id: meetingId,
@@ -150,188 +176,286 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
 
   const started = d.meeting.started_at.slice(0, 16).replace("T", " ");
 
+  // 状态动效与判断：录音解析中 / 纪要生成中
+  const isTranscribing =
+    step?.phase === "transcribing" ||
+    (step === null && d.meeting.status === "processing" && utterances.length === 0);
+  const isSummarizing =
+    step?.phase === "summarizing" ||
+    (step === null && d.meeting.status === "processing" && utterances.length > 0 && !d.summary);
+
+  // 逐字稿总字符数统计
+  const totalCharacters = utterances.reduce((acc, u) => acc + (u.text ? u.text.length : 0), 0);
+
+  // 右侧快速导航项：录音、纪要、随手记、逐字稿
+  const navItems = [
+    ...(src ? [{ id: "section-player", label: "录音" }] : []),
+    { id: "section-summary", label: "纪要" },
+    ...(d.note.trim() !== "" ? [{ id: "section-notes", label: "随手记" }] : []),
+    { id: "section-transcript", label: "逐字稿" },
+  ];
+
   return (
-    <div className="doc">
-      <div className="meeting-head">
-        <h2>{d.meeting.title}</h2>
-        <span className="data">
-          {started} · {formatTs(d.meeting.duration_ms)} · {d.attendees.length} 人 ·{" "}
-          {d.utterance_count} 条发言
-        </span>
-      </div>
-
-      {src && (
-        <div className="player">
-          <audio
-            ref={audio}
-            src={src}
-            onLoadedMetadata={(e) => setDur(e.currentTarget.duration || 0)}
-            onTimeUpdate={(e) => setAt(e.currentTarget.currentTime)}
-            onEnded={() => setPlaying(false)}
-          />
-          <button className="play" onClick={toggle} aria-label={playing ? "暂停" : "播放"}>
-            {playing ? (
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="currentColor">
-                <rect width="3.5" height="13" /><rect x="8.5" width="3.5" height="13" />
-              </svg>
-            ) : (
-              <svg width="12" height="13" viewBox="0 0 12 13" fill="currentColor">
-                <path d="M0 0l12 6.5L0 13z" />
-              </svg>
-            )}
-          </button>
-          <div className="scrub" onClick={seek}>
-            <div className="track" />
-            <div className="fill" style={{ width: dur ? `${(at / dur) * 100}%` : 0 }} />
-            <div className="head" style={{ left: dur ? `${(at / dur) * 100}%` : 0 }} />
-          </div>
-          <span className="data">{clock(at)} / {clock(dur)}</span>
+    <div className="doc-wrapper">
+      <div className="doc">
+        {/* 会议标题与基本信息 */}
+        <div className="meeting-head" id="section-header">
+          <h2>{d.meeting.title}</h2>
+          <span className="data">
+            {started} · {formatTs(d.meeting.duration_ms)} · {d.attendees.length} 人 ·{" "}
+            {d.utterance_count} 条发言
+          </span>
         </div>
-      )}
 
-      {d.keywords.length > 0 && (
-        <div className="chips">
-          {d.keywords.map((k) => (
-            <span className="chip key" key={k}>{k}</span>
-          ))}
-        </div>
-      )}
-
-      {d.attendees.length > 0 && (
-        <p className="people">
-          参会 <b>{d.attendees.join("、")}</b>
-        </p>
-      )}
-
-      {d.note.trim() !== "" && (
-        <>
-          <h2 className="section">随手记</h2>
-          <div className="jots">
-            {d.note
-              .split(NL)
-              .map((l) => l.trim())
-              .filter((l) => l !== "")
-              .map((line, i) => {
-                const m = /^\[(\d{1,2}:\d{2})\]\s*(.*)$/.exec(line);
-                return (
-                  <div className="jot" key={i}>
-                    {m && <span className="data">{m[1]}</span>}
-                    {m ? m[2] : line}
-                  </div>
-                );
-              })}
-          </div>
-        </>
-      )}
-
-      <h2 className="section">会议纪要</h2>
-      {step ? (
-        <div className="fetching">
-          <p className="data" style={{ margin: 0 }}>
-            {step.phase === "transcribing" ? "重新识别录音" : "重写纪要"}
-            {step.detail ? ` · ${step.detail}` : ""}
-          </p>
-          <p className="note" style={{ marginTop: 6 }}>
-            用的是现在这份配置——模型、聚类阈值、出网策略都读当前值。完成后这一页自己刷新。
-          </p>
-        </div>
-      ) : d.summary ? (
-        <div className="prose">{d.summary}</div>
-      ) : (
-        <div className="hollow">
-          {d.meeting.status === "processing" ? "正在整理" : "这场会议还没有纪要"}
-        </div>
-      )}
-
-      <div className="actions">
-        {d.summary && (
-          <>
-            <button className="act" onClick={() => void saveMarkdown()}>另存为 Markdown</button>
-            <button className="act" onClick={() => window.print()}>另存为 PDF</button>
-          </>
-        )}
-        {utterances.length > 0 && (
-          <button
-            className="act"
-            disabled={step !== null}
-            title="逐字稿不动，只用当前配置的模型重写一遍纪要"
-            onClick={() => void reprocess("summary")}
-          >
-            重写纪要
-          </button>
-        )}
-        {hasAudio && (
-          <>
-            <label className="headcount">
-              参会人数
-              <input
-                type="number"
-                min={1}
-                max={64}
-                value={speakers2}
-                placeholder="不填就自己猜"
-                disabled={step !== null}
-                onChange={(e) => setSpeakers2(e.target.value)}
-              />
-            </label>
-            <button
-              className="act"
-              disabled={step !== null}
-              title="从盘上的录音重跑：识别 → 说话人分离 → 纪要"
-              onClick={() => void reprocess("full")}
-            >
-              重新解析录音
+        {/* 录音播放器 */}
+        {src && (
+          <div className="player" id="section-player">
+            <audio
+              ref={audio}
+              src={src}
+              onLoadedMetadata={(e) => setDur(e.currentTarget.duration || 0)}
+              onTimeUpdate={(e) => setAt(e.currentTarget.currentTime)}
+              onEnded={() => setPlaying(false)}
+            />
+            <button className="play" onClick={toggle} aria-label={playing ? "暂停" : "播放"}>
+              {playing ? (
+                <svg width="12" height="13" viewBox="0 0 12 13" fill="currentColor">
+                  <rect width="3.5" height="13" />
+                  <rect x="8.5" width="3.5" height="13" />
+                </svg>
+              ) : (
+                <svg width="12" height="13" viewBox="0 0 12 13" fill="currentColor">
+                  <path d="M0 0l12 6.5L0 13z" />
+                </svg>
+              )}
             </button>
-          </>
+            <div className="scrub" onClick={seek}>
+              <div className="track" />
+              <div className="fill" style={{ width: dur ? `${(at / dur) * 100}%` : 0 }} />
+              <div className="head" style={{ left: dur ? `${(at / dur) * 100}%` : 0 }} />
+            </div>
+            <span className="data">
+              {clock(at)} / {clock(dur)}
+            </span>
+          </div>
         )}
-      </div>
-      {(utterances.length > 0 || hasAudio) && !step && (
-        <p className="note">
-          对这版纪要不满意就重写一遍。换个模型再点，就是换个模型重写——
-          按下去那一刻的设置说了算。旧版本不会被删，界面显示最新的一版。
-          {hasAudio && speakers.length > 6 && (
-            <>
-              <br />
-              这场切出了 {speakers.length} 个说话人，多半是聚类过分裂了。
-              填上真实参会人数再解析一次，会准得多。
-            </>
-          )}
-        </p>
-      )}
 
-      {utterances.length > 0 && (
-        <details className="fold">
-          <summary>逐字稿 · {utterances.length} 条</summary>
+        {/* 关键词 */}
+        {d.keywords.length > 0 && (
+          <div className="chips">
+            {d.keywords.map((k) => (
+              <span className="chip key" key={k}>
+                {k}
+              </span>
+            ))}
+          </div>
+        )}
 
-          {speakers.length > 0 && (
-            <div style={{ margin: "14px 0 22px" }}>
-              {speakers.map((s) => (
-                <div className="namer" key={s.key}>
-                  <code>{s.key}</code>
-                  <span className="ex">{s.sample}</span>
-                  <input
-                    value={names[s.key] ?? ""}
-                    placeholder="这是谁"
-                    onChange={(e) => setNames({ ...names, [s.key]: e.target.value })}
-                    onBlur={() => void saveName(s.key)}
-                    onKeyDown={(e) => e.key === "Enter" && void saveName(s.key)}
-                  />
-                </div>
-              ))}
-            </div>
-          )}
+        {/* 参会人折叠展示（需求2：最多3行，渐隐，hover tips，点击展开与收起） */}
+        <AttendeesFold attendees={d.attendees} />
 
-          {utterances.map((u) => (
-            <div className={u.low_confidence ? "line doubt" : "line"} key={u.id}>
-              <div className="who">
-                <b>{u.speaker_name ?? u.speaker_id}</b>
-                <span className="data">{formatTs(u.start_ms)}</span>
+        {/* 会议纪要区域 */}
+        <div id="section-summary" className="section-block">
+          <div className="section-title-row">
+            <h2 className="section">
+              <span className="section-title-tag">会议纪要</span>
+            </h2>
+
+            {/* 正在生成纪要时隐藏按钮并展示占位动效 */}
+            {!isSummarizing && (
+              <button
+                type="button"
+                className="icon-btn-circle"
+                title="重新生成"
+                aria-label="重新生成"
+                disabled={step !== null}
+                onClick={() => void reprocess("summary")}
+              >
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                  <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+                  <path d="M21 3v5h-5" />
+                  <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+                  <path d="M3 21v-5h5" />
+                </svg>
+              </button>
+            )}
+          </div>
+
+          {/* 生成中占位 svg 动效 */}
+          {isSummarizing ? (
+            <div className="fetching-placeholder">
+              <div className="scanning-wave">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <path d="M12 3v3M12 18v3M4.93 4.93l2.12 2.12M16.95 16.95l2.12 2.12M3 12h3M18 12h3M4.93 19.07l2.12-2.12M16.95 7.05l2.12-2.12" className="spin-slow" />
+                  <circle cx="12" cy="12" r="4" strokeDasharray="3 3" />
+                </svg>
               </div>
-              <div className="said">{u.text}</div>
+              <p className="data" style={{ margin: "8px 0 2px" }}>
+                正在提炼会议纪要...
+              </p>
+              <span className="note">{step?.detail || "根据发言全文生成段落、要点与行动项"}</span>
             </div>
-          ))}
-        </details>
-      )}
+          ) : d.summary ? (
+            <MarkdownRenderer content={d.summary} />
+          ) : (
+            <div className="hollow">
+              {d.meeting.status === "processing" ? "正在整理" : "这场会议还没有纪要"}
+            </div>
+          )}
+
+          {/* 另存为两个按钮单独一行（需求4） */}
+          {d.summary && !isSummarizing && (
+            <div className="export-actions-row">
+              <button className="act" onClick={() => void saveMarkdown()}>
+                另存为 Markdown
+              </button>
+              <button className="act" onClick={() => window.print()}>
+                另存为 PDF
+              </button>
+            </div>
+          )}
+        </div>
+
+        {/* 随手记区域（需求10：挪到纪要后、逐字稿前，支持整段收起和展开） */}
+        {d.note.trim() !== "" && (
+          <div id="section-notes" className="section-block">
+            <div
+              className="section-title-row collapsible"
+              onClick={() => setNotesOpen(!notesOpen)}
+            >
+              <div className="section-title-left">
+                <h2 className="section">
+                  <span className="section-title-tag">随手记</span>
+                </h2>
+              </div>
+              <div className="section-title-actions">
+                <button type="button" className="collapse-toggle-btn">
+                  {notesOpen ? "收起 ↑" : "展开 ↓"}
+                </button>
+              </div>
+            </div>
+
+            {notesOpen && (
+              <div className="jots">
+                {d.note
+                  .split(NL)
+                  .map((l) => l.trim())
+                  .filter((l) => l !== "")
+                  .map((line, i) => {
+                    const m = /^\[(\d{1,2}:\d{2})\]\s*(.*)$/.exec(line);
+                    return (
+                      <div className="jot" key={i}>
+                        {m && <span className="data">{m[1]}</span>}
+                        {m ? m[2] : line}
+                      </div>
+                    );
+                  })}
+              </div>
+            )}
+          </div>
+        )}
+
+        {/* 逐字稿区域（需求6：显示条数与字符数，增加刷新圆圈按钮，解析时svg占位动画并隐藏按钮） */}
+        <div id="section-transcript" className="section-block">
+          <div className="section-title-row">
+            <div
+              className="section-title-left collapsible"
+              onClick={() => setTranscriptOpen(!transcriptOpen)}
+            >
+              <h2 className="section">
+                <span className="section-title-tag">逐字稿</span>
+              </h2>
+              {utterances.length > 0 && (
+                <span className="transcript-stats">
+                  · {utterances.length} 条 · {totalCharacters.toLocaleString()} 字
+                </span>
+              )}
+            </div>
+
+            <div className="section-title-actions">
+              <button
+                type="button"
+                className="collapse-toggle-btn"
+                onClick={() => setTranscriptOpen(!transcriptOpen)}
+              >
+                {transcriptOpen ? "收起 ↑" : "展开 ↓"}
+              </button>
+
+              {/* 刷新按钮：hover后提示文字“重新解析录音”，解析录音时隐藏按钮 */}
+              {hasAudio && !isTranscribing && (
+                <button
+                  type="button"
+                  className="icon-btn-circle"
+                  title="重新解析录音"
+                  aria-label="重新解析录音"
+                  disabled={step !== null}
+                  onClick={() => void reprocess("full")}
+                >
+                  <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+                    <path d="M3 12a9 9 0 0 1 15-6.7L21 8" />
+                    <path d="M21 3v5h-5" />
+                    <path d="M21 12a9 9 0 0 1-15 6.7L3 16" />
+                    <path d="M3 21v-5h5" />
+                  </svg>
+                </button>
+              )}
+            </div>
+          </div>
+
+          {/* 解析录音中占位 svg 动效 */}
+          {isTranscribing ? (
+            <div className="fetching-placeholder">
+              <div className="scanning-wave">
+                <svg width="32" height="32" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.5">
+                  <path d="M2 10v4M6 6v12M10 3v18M14 8v8M18 5v14M22 10v4" className="wave-bars" />
+                </svg>
+              </div>
+              <p className="data" style={{ margin: "8px 0 2px" }}>
+                正在解析录音与声学特征...
+              </p>
+              <span className="note">{step?.detail || "分离说话人并转写发言中"}</span>
+            </div>
+          ) : (
+            transcriptOpen &&
+            utterances.length > 0 && (
+              <div className="transcript-content">
+                {speakers.length > 0 && (
+                  <div className="speaker-namers">
+                    {speakers.map((s) => (
+                      <div className="namer" key={s.key}>
+                        <code>{s.key}</code>
+                        <span className="ex">{s.sample}</span>
+                        <input
+                          value={names[s.key] ?? ""}
+                          placeholder="这是谁"
+                          onChange={(e) => setNames({ ...names, [s.key]: e.target.value })}
+                          onBlur={() => void saveName(s.key)}
+                          onKeyDown={(e) => e.key === "Enter" && void saveName(s.key)}
+                        />
+                      </div>
+                    ))}
+                  </div>
+                )}
+
+                <div className="utterance-lines">
+                  {utterances.map((u) => (
+                    <div className={u.low_confidence ? "line doubt" : "line"} key={u.id}>
+                      <div className="who">
+                        <b>{u.speaker_name ?? u.speaker_id}</b>
+                        <span className="data">{formatTs(u.start_ms)}</span>
+                      </div>
+                      <div className="said">{u.text}</div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+            )
+          )}
+        </div>
+      </div>
+
+      {/* 右侧固定的快速导航（需求1） */}
+      <QuickNav items={navItems} />
     </div>
   );
 }
