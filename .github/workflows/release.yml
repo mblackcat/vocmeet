@@ -16,6 +16,8 @@ jobs:
         include:
           - platform: windows-latest
             args: ""
+          - platform: macos-latest
+            args: ""
 
     runs-on: ${{ matrix.platform }}
     steps:
@@ -49,9 +51,22 @@ jobs:
             ### 安装说明
             - 首次安装运行后，请前往「设置」页点击「一键下载模型」以初始化离线语音识别与说话人分离权重。
             - 纪要生成推荐配合本地 Ollama (`ollama serve && ollama pull qwen2.5:7b`)。
+            - macOS 版本暂未支持系统音频采集（见 README「已知限制」），可通过拖拽已有录音文件使用转写与纪要功能。
 
             ### 合规提示
             请遵守当地录音法律规范，开启录制前确保已取得全体参会人知情同意。详情参见项目 `DISCLAIMER.md`。
           releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}
+
+  publish:
+    name: 发布 Release
+    needs: release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: 取消草稿，正式发布
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: gh release edit "${{ github.ref_name }}" --draft=false --repo "${{ github.repository }}"

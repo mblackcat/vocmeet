@@ -30,20 +30,21 @@
   },
   "bundle": {
     "active": true,
-    "targets": [
-      "msi",
-      "nsis"
-    ],
+    "targets": "all",
     "icon": [
       "icons/icon.png",
-      "icons/icon.ico"
+      "icons/icon.ico",
+      "icons/icon.icns"
     ],
     "resources": {
       "../templates/meeting_default.yaml": "templates/meeting_default.yaml"
     },
     "copyright": "",
     "shortDescription": "离线会议纪要",
-    "longDescription": "全量录制、会后本地转写与说话人分离、结合速记生成结构化会议纪要。"
+    "longDescription": "全量录制、会后本地转写与说话人分离、结合速记生成结构化会议纪要。",
+    "macOS": {
+      "category": "public.app-category.productivity"
+    }
   },
   "plugins": {}
 }
