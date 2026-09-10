@@ -49,6 +49,17 @@ export const api = {
     invoke<void>("reprocess_meeting", { meetingId, mode, speakers: speakers ?? null }),
   getMeeting: (meetingId: number) => invoke<Meeting | null>("get_meeting", { meetingId }),
   deleteMeeting: (meetingId: number) => invoke<void>("delete_meeting", { meetingId }),
+  archiveMeeting: (meetingId: number, archived: boolean) =>
+    invoke<void>("archive_meeting", { meetingId, archived }),
+  listArchivedMeetings: () => invoke<Meeting[]>("list_archived_meetings"),
+  exportMeetingAudio: (meetingId: number, targetPath: string) =>
+    invoke<string>("export_meeting_audio", { meetingId, targetPath }),
+  exportTranscriptMarkdown: (meetingId: number, targetPath: string) =>
+    invoke<string>("export_transcript_markdown", { meetingId, targetPath }),
+  exportSummaryMarkdown: (meetingId: number, targetPath: string) =>
+    invoke<string>("export_summary_markdown", { meetingId, targetPath }),
+  getMeetingShareText: (meetingId: number) =>
+    invoke<string>("get_meeting_share_text", { meetingId }),
 
   startRecording: (title: string) => invoke<number>("start_recording", { title }),
   stopRecording: () => invoke<StopResult>("stop_recording"),

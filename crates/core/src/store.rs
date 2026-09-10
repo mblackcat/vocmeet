@@ -113,7 +113,7 @@ pub struct Store {
     cipher: Cipher,
 }
 
-#[derive(Debug, Clone, serde::Serialize)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Meeting {
     pub id: i64,
     pub title: String,
@@ -121,6 +121,8 @@ pub struct Meeting {
     pub ended_at: Option<String>,
     pub duration_ms: i64,
     pub status: String,
+    #[serde(default)]
+    pub archived_at: Option<String>,
 }
 
 impl Store {
@@ -161,7 +163,8 @@ impl Store {
                 ended_at    TEXT,
                 duration_ms INTEGER NOT NULL DEFAULT 0,
                 status      TEXT NOT NULL DEFAULT 'recording',
-                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                archived_at TEXT
             );
 
             CREATE TABLE IF NOT EXISTS audio_chunks (
@@ -246,6 +249,7 @@ impl Store {
             CREATE INDEX IF NOT EXISTS idx_chunk_meeting ON audio_chunks(meeting_id, source, seq);
             "#,
         )?;
+        let _ = self.conn.execute("ALTER TABLE meetings ADD COLUMN archived_at TEXT", []);
         Ok(())
     }
 
@@ -284,8 +288,8 @@ impl Store {
 
     pub fn list_meetings(&self) -> Result<Vec<Meeting>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, started_at, ended_at, duration_ms, status
-             FROM meetings ORDER BY id DESC",
+            "SELECT id, title, started_at, ended_at, duration_ms, status, archived_at
+             FROM meetings WHERE archived_at IS NULL ORDER BY id DESC",
         )?;
         let rows = stmt
             .query_map([], |r| {
@@ -296,17 +300,18 @@ impl Store {
                     ended_at: r.get(3)?,
                     duration_ms: r.get(4)?,
                     status: r.get(5)?,
+                    archived_at: r.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
     }
 
-    /// 分页列出会议。会议数量会随使用增长，侧栏不能一次性全加载。
+    /// 分页列出会议（未归档）。会议数量会随使用增长，侧栏不能一次性全加载。
     pub fn list_meetings_page(&self, offset: i64, limit: i64) -> Result<Vec<Meeting>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, title, started_at, ended_at, duration_ms, status
-             FROM meetings ORDER BY id DESC LIMIT ?1 OFFSET ?2",
+            "SELECT id, title, started_at, ended_at, duration_ms, status, archived_at
+             FROM meetings WHERE archived_at IS NULL ORDER BY id DESC LIMIT ?1 OFFSET ?2",
         )?;
         let rows = stmt
             .query_map(params![limit, offset], |r| {
@@ -317,6 +322,7 @@ impl Store {
                     ended_at: r.get(3)?,
                     duration_ms: r.get(4)?,
                     status: r.get(5)?,
+                    archived_at: r.get(6)?,
                 })
             })?
             .collect::<std::result::Result<Vec<_>, _>>()?;
@@ -326,7 +332,51 @@ impl Store {
     pub fn count_meetings(&self) -> Result<i64> {
         Ok(self
             .conn
-            .query_row("SELECT COUNT(*) FROM meetings", [], |r| r.get(0))?)
+            .query_row("SELECT COUNT(*) FROM meetings WHERE archived_at IS NULL", [], |r| r.get(0))?)
+    }
+
+    /// 列出所有已归档会议。
+    pub fn list_archived_meetings(&self) -> Result<Vec<Meeting>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, title, started_at, ended_at, duration_ms, status, archived_at
+             FROM meetings WHERE archived_at IS NOT NULL ORDER BY id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok(Meeting {
+                    id: r.get(0)?,
+                    title: r.get(1)?,
+                    started_at: r.get(2)?,
+                    ended_at: r.get(3)?,
+                    duration_ms: r.get(4)?,
+                    status: r.get(5)?,
+                    archived_at: r.get(6)?,
+                })
+            })?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        Ok(rows)
+    }
+
+    pub fn count_archived_meetings(&self) -> Result<i64> {
+        Ok(self
+            .conn
+            .query_row("SELECT COUNT(*) FROM meetings WHERE archived_at IS NOT NULL", [], |r| r.get(0))?)
+    }
+
+    /// 归档或取消归档会议（软删除）。
+    pub fn archive_meeting(&self, meeting_id: i64, archived: bool) -> Result<()> {
+        if archived {
+            self.conn.execute(
+                "UPDATE meetings SET archived_at = datetime('now') WHERE id = ?1",
+                params![meeting_id],
+            )?;
+        } else {
+            self.conn.execute(
+                "UPDATE meetings SET archived_at = NULL WHERE id = ?1",
+                params![meeting_id],
+            )?;
+        }
+        Ok(())
     }
 
     /// 保存关键词（明文——它们是派生的主题词，不含原始发言内容）。
@@ -384,7 +434,7 @@ impl Store {
         let m = self
             .conn
             .query_row(
-                "SELECT id, title, started_at, ended_at, duration_ms, status FROM meetings WHERE id = ?1",
+                "SELECT id, title, started_at, ended_at, duration_ms, status, archived_at FROM meetings WHERE id = ?1",
                 params![meeting_id],
                 |r| {
                     Ok(Meeting {
@@ -394,6 +444,7 @@ impl Store {
                         ended_at: r.get(3)?,
                         duration_ms: r.get(4)?,
                         status: r.get(5)?,
+                        archived_at: r.get(6)?,
                     })
                 },
             )
@@ -802,5 +853,36 @@ mod tests {
         s.replace_utterances(id, &[utt(1, "x", Source::System)]).unwrap();
         s.delete_meeting(id).unwrap();
         assert!(s.load_utterances(id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn archive_meeting_soft_deletes_from_main_list() {
+        let s = Store::open_in_memory(&key()).unwrap();
+        let id1 = s.create_meeting("m1", "t1").unwrap();
+        let id2 = s.create_meeting("m2", "t2").unwrap();
+
+        assert_eq!(s.count_meetings().unwrap(), 2);
+        assert_eq!(s.count_archived_meetings().unwrap(), 0);
+        assert!(s.list_archived_meetings().unwrap().is_empty());
+
+        // 归档 m1
+        s.archive_meeting(id1, true).unwrap();
+        assert_eq!(s.count_meetings().unwrap(), 1);
+        assert_eq!(s.count_archived_meetings().unwrap(), 1);
+
+        let active = s.list_meetings().unwrap();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].id, id2);
+
+        let archived = s.list_archived_meetings().unwrap();
+        assert_eq!(archived.len(), 1);
+        assert_eq!(archived[0].id, id1);
+        assert!(archived[0].archived_at.is_some());
+
+        // 恢复 m1
+        s.archive_meeting(id1, false).unwrap();
+        assert_eq!(s.count_meetings().unwrap(), 2);
+        assert_eq!(s.count_archived_meetings().unwrap(), 0);
+        assert!(s.list_archived_meetings().unwrap().is_empty());
     }
 }

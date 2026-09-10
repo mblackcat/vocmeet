@@ -6,15 +6,17 @@ import type {
   DeviceInfo,
   DoctorReport,
   LlmDiagnosis,
+  Meeting,
   ModelFetchEvent,
   ModelPlan,
   PullEvent,
   SuggestedModel,
 } from "../types";
-import { formatBytes } from "../types";
+import { formatBytes, formatTs } from "../types";
 
 interface Props {
   onError: (msg: string) => void;
+  onMeetingChanged?: () => void;
 }
 
 function phaseText(phase: string): string {
@@ -104,7 +106,7 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
 ];
 
 /** 设置与自检合并在一页：都是「这台机器上的事」，没必要分成两个入口。 */
-export default function Settings({ onError }: Props) {
+export default function Settings({ onError, onMeetingChanged }: Props) {
   const [cfg, setCfg] = useState<AppConfig | null>(null);
   const [choices, setChoices] = useState<[string, string][]>([]);
   const [apiKey, setApiKey] = useState("");
@@ -120,6 +122,45 @@ export default function Settings({ onError }: Props) {
   const [probing, setProbing] = useState(false);
   const [suggested, setSuggested] = useState<SuggestedModel[]>([]);
   const [pulling, setPulling] = useState<PullEvent | null>(null);
+  const [archivedList, setArchivedList] = useState<Meeting[]>([]);
+
+  const loadArchived = async () => {
+    try {
+      const list = await api.listArchivedMeetings();
+      setArchivedList(list);
+    } catch (e) {
+      onError(asMessage(e));
+    }
+  };
+
+  const handleRestore = async (id: number, title: string) => {
+    try {
+      await api.archiveMeeting(id, false);
+      setMsg(`已恢复会议「${title}」至主列表`);
+      await loadArchived();
+      onMeetingChanged?.();
+    } catch (e) {
+      onError(asMessage(e));
+    }
+  };
+
+  const handleDelete = async (id: number, title: string) => {
+    if (
+      !window.confirm(
+        `确定要彻底删除会议「${title}」吗？\n所有录音、逐字稿与纪要将被永久清除且不可恢复。`
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.deleteMeeting(id);
+      setMsg(`已永久删除会议「${title}」`);
+      await loadArchived();
+      onMeetingChanged?.();
+    } catch (e) {
+      onError(asMessage(e));
+    }
+  };
 
   const refreshDoctor = async () => {
     try {
@@ -194,6 +235,7 @@ export default function Settings({ onError }: Props) {
       } catch (e) {
         onError(asMessage(e));
       }
+      void loadArchived();
     })();
   }, [onError]);
 
@@ -672,6 +714,49 @@ export default function Settings({ onError }: Props) {
           ))}
           <p className="note">数据存放在 {report.data_dir}</p>
         </>
+      )}
+
+      <h2 className="section">已归档会议 ({archivedList.length})</h2>
+      <p className="note" style={{ marginTop: 0 }}>
+        归档的会议会从侧边栏主列表中隐藏，所有录音、逐字稿与纪要数据完整保留。
+      </p>
+      {archivedList.length === 0 ? (
+        <div className="note" style={{ padding: "10px 0" }}>
+          暂无已归档的会议。在侧边栏会议记录上右键选择「归档会议」即可收纳至此。
+        </div>
+      ) : (
+        <div className="archived-list">
+          {archivedList.map((m) => (
+            <div className="archived-item" key={m.id}>
+              <div className="archived-info">
+                <div className="archived-title" title={m.title}>
+                  {m.title}
+                </div>
+                <div className="archived-meta data">
+                  {m.started_at.slice(0, 16).replace("T", " ")} · {formatTs(m.duration_ms)}
+                </div>
+              </div>
+              <div className="archived-actions">
+                <button
+                  className="act"
+                  style={{ padding: "4px 10px", fontSize: 12 }}
+                  onClick={() => void handleRestore(m.id, m.title)}
+                  title="恢复到侧边栏主列表"
+                >
+                  恢复
+                </button>
+                <button
+                  className="act"
+                  style={{ padding: "4px 10px", fontSize: 12, color: "var(--live)" }}
+                  onClick={() => void handleDelete(m.id, m.title)}
+                  title="彻底删除并清理磁盘数据"
+                >
+                  彻底删除
+                </button>
+              </div>
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );

@@ -1503,6 +1503,147 @@ fn export_markdown(state: State<AppState>, meeting_id: i64, path: String) -> R<S
 }
 
 #[tauri::command]
+fn archive_meeting(state: State<AppState>, meeting_id: i64, archived: bool) -> R<()> {
+    state.store()?.archive_meeting(meeting_id, archived).map_err(err)
+}
+
+#[tauri::command]
+fn list_archived_meetings(state: State<AppState>) -> R<Vec<Meeting>> {
+    state.store()?.list_archived_meetings().map_err(err)
+}
+
+#[tauri::command]
+fn export_meeting_audio(state: State<AppState>, meeting_id: i64, target_path: String) -> R<String> {
+    let cfg = state.config()?;
+    let store = state.store()?;
+    let playback = store.get_playback_path(meeting_id).map_err(err)?;
+    let audio = locate_meeting_audio(&cfg, meeting_id, playback.as_deref());
+
+    let src_path = if let Some(p) = audio.single_wav {
+        p
+    } else {
+        let dir = cfg.audio_dir().join(format!("meeting_{meeting_id}"));
+        let p = dir.join("playback.wav");
+        if p.is_file() {
+            p
+        } else {
+            return Err("未找到该会议的完整音频源文件".into());
+        }
+    };
+
+    let target = PathBuf::from(&target_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::copy(&src_path, &target).map_err(err)?;
+    Ok(target.display().to_string())
+}
+
+#[tauri::command]
+fn export_transcript_markdown(state: State<AppState>, meeting_id: i64, target_path: String) -> R<String> {
+    let store = state.store()?;
+    let meeting = store
+        .get_meeting(meeting_id)
+        .map_err(err)?
+        .ok_or("会议不存在")?;
+    let utterances = store.load_utterances(meeting_id).map_err(err)?;
+
+    let mut md = format!("# {} - 逐字稿\n\n", meeting.title);
+    md.push_str(&format!("- 开始时间：{}\n", meeting.started_at));
+    md.push_str(&format!(
+        "- 时长：{}\n",
+        format_ts(meeting.duration_ms as u32)
+    ));
+    md.push_str(&format!("- 发言条数：{}\n\n", utterances.len()));
+
+    md.push_str("## 逐字记录\n\n");
+    for u in &utterances {
+        let mark = if u.low_confidence {
+            " *(识别存疑)*"
+        } else {
+            ""
+        };
+        md.push_str(&format!(
+            "**[#{}] {} `{}`**：{}{}\n\n",
+            u.id,
+            u.display_speaker(),
+            format_ts(u.start_ms),
+            u.text,
+            mark
+        ));
+    }
+
+    let p = PathBuf::from(&target_path);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::write(&p, md).map_err(err)?;
+    Ok(p.display().to_string())
+}
+
+#[tauri::command]
+fn export_summary_markdown(state: State<AppState>, meeting_id: i64, target_path: String) -> R<String> {
+    let store = state.store()?;
+    let meeting = store
+        .get_meeting(meeting_id)
+        .map_err(err)?
+        .ok_or("会议不存在")?;
+    let summary = store.latest_summary(meeting_id).map_err(err)?;
+    let summary_text = summary.ok_or("该会议尚未生成纪要，请先进行总结")?;
+
+    let mut md = format!("# {} - 会议纪要\n\n", meeting.title);
+    md.push_str(&format!("- 时间：{}\n", meeting.started_at));
+    md.push_str(&format!(
+        "- 时长：{}\n\n",
+        format_ts(meeting.duration_ms as u32)
+    ));
+    md.push_str(&summary_text);
+    md.push_str("\n");
+
+    let p = PathBuf::from(&target_path);
+    if let Some(parent) = p.parent() {
+        std::fs::create_dir_all(parent).map_err(err)?;
+    }
+    std::fs::write(&p, md).map_err(err)?;
+    Ok(p.display().to_string())
+}
+
+#[tauri::command]
+fn get_meeting_share_text(state: State<AppState>, meeting_id: i64) -> R<String> {
+    let store = state.store()?;
+    let meeting = store
+        .get_meeting(meeting_id)
+        .map_err(err)?
+        .ok_or("会议不存在")?;
+    let summary = store.latest_summary(meeting_id).map_err(err)?;
+
+    if let Some(s) = summary {
+        Ok(format!(
+            "# {}\n时间：{} ｜ 时长：{}\n\n{}",
+            meeting.title,
+            meeting.started_at,
+            format_ts(meeting.duration_ms as u32),
+            s
+        ))
+    } else {
+        let utterances = store.load_utterances(meeting_id).map_err(err)?;
+        let mut text = format!(
+            "# {}\n时间：{} ｜ 时长：{}\n（暂无总结纪要）\n\n## 逐字稿节选\n",
+            meeting.title,
+            meeting.started_at,
+            format_ts(meeting.duration_ms as u32)
+        );
+        for u in utterances.iter().take(10) {
+            text.push_str(&format!("{}: {}\n", u.display_speaker(), u.text));
+        }
+        if utterances.len() > 10 {
+            text.push_str(&format!("... 共 {} 条发言\n", utterances.len()));
+        }
+        Ok(text)
+    }
+}
+
+#[tauri::command]
 fn get_config(state: State<AppState>) -> R<Config> {
     state.config()
 }
@@ -1672,6 +1813,8 @@ fn main() {
             suggested_llm_models,
             get_meeting,
             delete_meeting,
+            archive_meeting,
+            list_archived_meetings,
             start_recording,
             stop_recording,
             recording_status,
@@ -1686,6 +1829,10 @@ fn main() {
             summarize,
             get_summary,
             export_markdown,
+            export_meeting_audio,
+            export_transcript_markdown,
+            export_summary_markdown,
+            get_meeting_share_text,
             get_config,
             save_config,
             set_api_key,

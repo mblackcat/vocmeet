@@ -18,6 +18,7 @@ export interface Meeting {
   ended_at: string | null;
   duration_ms: number;
   status: string;
+  archived_at?: string | null;
 }
 
 export interface SpeakerRow {

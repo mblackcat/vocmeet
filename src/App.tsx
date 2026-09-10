@@ -1,12 +1,14 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import { save } from "@tauri-apps/plugin-dialog";
 import { api, asMessage, events } from "./api";
 import type { Meeting } from "./types";
 import { formatTs } from "./types";
 import Session from "./views/Session";
 import MeetingView from "./views/MeetingView";
 import Settings from "./views/Settings";
+import MeetingContextMenu from "./MeetingContextMenu";
 
 const PAGE = 20;
 
@@ -35,6 +37,24 @@ export default function App() {
   const [total, setTotal] = useState(0);
   const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  const [menu, setMenu] = useState<{ x: number; y: number; meeting: Meeting } | null>(null);
+
+  // 全局屏蔽系统/WebView 默认自带的右键菜单
+  useEffect(() => {
+    const handleContextMenu = (e: MouseEvent) => {
+      e.preventDefault();
+    };
+    window.addEventListener("contextmenu", handleContextMenu);
+    return () => window.removeEventListener("contextmenu", handleContextMenu);
+  }, []);
+
+  // 提示信息 4 秒后自动隐去
+  useEffect(() => {
+    if (!notice) return;
+    const timer = setTimeout(() => setNotice(null), 4000);
+    return () => clearTimeout(timer);
+  }, [notice]);
 
   /** 正在录制的会议 id。同一时刻至多一场。 */
   const [liveId, setLiveId] = useState<number | null>(null);
@@ -200,6 +220,75 @@ export default function App() {
     return formatTs(m.duration_ms);
   };
 
+  const handleShare = async (m: Meeting) => {
+    try {
+      const text = await api.getMeetingShareText(m.id);
+      await navigator.clipboard.writeText(text);
+      setError(null);
+      setNotice(`已复制「${m.title}」纪要到剪贴板`);
+    } catch (e) {
+      setError(`分享失败：${asMessage(e)}`);
+    }
+  };
+
+  const handleExportAudio = async (m: Meeting) => {
+    try {
+      const path = await save({
+        defaultPath: `${m.title}_录音.wav`,
+        filters: [{ name: "音频文件", extensions: ["wav", "aac", "m4a", "mp3"] }],
+      });
+      if (path) {
+        const out = await api.exportMeetingAudio(m.id, path);
+        setNotice(`音频源已成功导出至：${out}`);
+      }
+    } catch (e) {
+      setError(`导出音频失败：${asMessage(e)}`);
+    }
+  };
+
+  const handleExportTranscript = async (m: Meeting) => {
+    try {
+      const path = await save({
+        defaultPath: `${m.title}_逐字稿.md`,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (path) {
+        const out = await api.exportTranscriptMarkdown(m.id, path);
+        setNotice(`逐字稿已成功导出至：${out}`);
+      }
+    } catch (e) {
+      setError(`导出逐字稿失败：${asMessage(e)}`);
+    }
+  };
+
+  const handleExportSummary = async (m: Meeting) => {
+    try {
+      const path = await save({
+        defaultPath: `${m.title}_会议纪要.md`,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (path) {
+        const out = await api.exportSummaryMarkdown(m.id, path);
+        setNotice(`会议纪要已成功导出至：${out}`);
+      }
+    } catch (e) {
+      setError(`导出会议纪要失败：${asMessage(e)}`);
+    }
+  };
+
+  const handleArchive = async (m: Meeting) => {
+    try {
+      await api.archiveMeeting(m.id, true);
+      setNotice(`已归档「${m.title}」，可在设置中查看归档清单`);
+      if (stage.kind === "meeting" && stage.id === m.id) {
+        setStage({ kind: "session" });
+      }
+      await loadFirstPage();
+    } catch (e) {
+      setError(`归档失败：${asMessage(e)}`);
+    }
+  };
+
   return (
     <div className="shell">
       <aside className="rail">
@@ -240,6 +329,11 @@ export default function App() {
                   ? setStage({ kind: "session" })
                   : setStage({ kind: "meeting", id: m.id })
               }
+              onContextMenu={(e) => {
+                e.preventDefault();
+                e.stopPropagation();
+                setMenu({ x: e.clientX, y: e.clientY, meeting: m });
+              }}
             >
               <span className="t">{m.title}</span>
               <span className="m data">
@@ -260,6 +354,19 @@ export default function App() {
           <div className="banner">
             <span>{error}</span>
             <button onClick={() => setError(null)} aria-label="关闭">×</button>
+          </div>
+        )}
+        {notice && (
+          <div
+            className="msg"
+            style={{
+              margin: "14px 24px 0",
+              color: "var(--signal)",
+              borderBottom: "1px solid var(--rule)",
+              paddingBottom: "8px",
+            }}
+          >
+            {notice}
           </div>
         )}
 
@@ -286,7 +393,9 @@ export default function App() {
               onBusy={setBusyId}
             />
           )}
-          {stage.kind === "settings" && <Settings onError={setError} />}
+          {stage.kind === "settings" && (
+            <Settings onError={setError} onMeetingChanged={loadFirstPage} />
+          )}
         </div>
 
         {hovering && (
@@ -308,6 +417,20 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {menu && (
+        <MeetingContextMenu
+          x={menu.x}
+          y={menu.y}
+          meeting={menu.meeting}
+          onClose={() => setMenu(null)}
+          onShare={handleShare}
+          onExportAudio={handleExportAudio}
+          onExportTranscript={handleExportTranscript}
+          onExportSummary={handleExportSummary}
+          onArchive={handleArchive}
+        />
+      )}
     </div>
   );
 }
