@@ -29,7 +29,7 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
   const [hasAudio, setHasAudio] = useState(false);
   const [step, setStep] = useState<ProcessEvent | null>(null);
   const [notesOpen, setNotesOpen] = useState(true);
-  const [transcriptOpen, setTranscriptOpen] = useState(true);
+  const [transcriptOpen, setTranscriptOpen] = useState(false);
 
   const audio = useRef<HTMLAudioElement>(null);
   const curMeetingIdRef = useRef<number>(meetingId);
@@ -73,6 +73,7 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
     setPlaying(false);
     setAt(0);
     setDur(0);
+    setTranscriptOpen(false);
 
     void load(meetingId);
     void api.meetingHasAudio(meetingId).then((has) => {
@@ -167,6 +168,20 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
     } catch (e) {
       onError(asMessage(e));
     }
+  };
+
+  /** 点击纪要中的 [#ID] 溯源胶囊：自动展开逐字稿并平滑滚动高亮到对应发言 */
+  const jumpToUtterance = (id: number) => {
+    setTranscriptOpen(true);
+    setTimeout(() => {
+      const el = document.getElementById(`utt-${id}`);
+      if (el) {
+        el.scrollIntoView({ behavior: "smooth", block: "center" });
+        el.classList.remove("highlight-flash");
+        void el.offsetWidth; // 触发 reflow 重带动效
+        el.classList.add("highlight-flash");
+      }
+    }, 80);
   };
 
   const clock = (s: number) => {
@@ -296,7 +311,7 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
               <span className="note">{step?.detail || "根据发言全文生成段落、要点与行动项"}</span>
             </div>
           ) : d.summary ? (
-            <MarkdownRenderer content={d.summary} />
+            <MarkdownRenderer content={d.summary} onJumpToUtterance={jumpToUtterance} />
           ) : (
             <div className="hollow">
               {d.meeting.status === "processing" ? "正在整理" : "这场会议还没有纪要"}
@@ -439,7 +454,11 @@ export default function MeetingView({ meetingId, onError, onChanged, onBusy }: P
 
                 <div className="utterance-lines">
                   {utterances.map((u) => (
-                    <div className={u.low_confidence ? "line doubt" : "line"} key={u.id}>
+                    <div
+                      id={`utt-${u.id}`}
+                      className={u.low_confidence ? "line doubt" : "line"}
+                      key={u.id}
+                    >
                       <div className="who">
                         <b>{u.speaker_name ?? u.speaker_id}</b>
                         <span className="data">{formatTs(u.start_ms)}</span>

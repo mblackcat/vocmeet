@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  release:
+    name: Build & Release (${{ matrix.platform }})
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: windows-latest
+            args: ""
+
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: swatinem/rust-cache@v2
+
+      - name: Install Frontend Dependencies
+        run: npm ci
+
+      - name: Build Desktop Bundle
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: 'VocMeet ${{ github.ref_name }}'
+          releaseBody: |
+            ## VocMeet 声会 ${{ github.ref_name }} 发布日志
+
+            ### 安装说明
+            - 首次安装运行后，请前往「设置」页点击「一键下载模型」以初始化离线语音识别与说话人分离权重。
+            - 纪要生成推荐配合本地 Ollama (`ollama serve && ollama pull qwen2.5:7b`)。
+
+            ### 合规提示
+            请遵守当地录音法律规范，开启录制前确保已取得全体参会人知情同意。详情参见项目 `DISCLAIMER.md`。
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

@@ -1438,12 +1438,39 @@ fn run_summarize(
     let template_path = cfg.templates_dir.join("meeting_default.yaml");
     let template = Template::load(&template_path).map_err(err)?;
 
-    let mut attendees: Vec<String> = utterances
-        .iter()
-        .map(|u| u.display_speaker().to_string())
-        .collect();
-    attendees.sort();
-    attendees.dedup();
+    // 统计每位发言人的发言条数，按活跃频次降序排列
+    let mut speaker_counts: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+    for u in &utterances {
+        *speaker_counts.entry(u.display_speaker().to_string()).or_default() += 1;
+    }
+    let mut sorted_speakers: Vec<String> = speaker_counts.keys().cloned().collect();
+    sorted_speakers.sort_by(|a, b| speaker_counts[b].cmp(&speaker_counts[a]));
+
+    // 参会人防爆炸保护：参会人过多时（聚类过分裂可能达数百人），
+    // 仅保留发言最活跃的前8位核心发言人加"等共N人"，绝不让模型耗尽token去复读几百个代号
+    let total_speakers = sorted_speakers.len();
+    let attendees: Vec<String> = if total_speakers > 8 {
+        let mut top: Vec<String> = sorted_speakers.into_iter().take(8).collect();
+        top.push(format!("等共 {} 人", total_speakers));
+        top
+    } else {
+        sorted_speakers
+    };
+
+    // 接入设置中的预设信息：行业专用词库与系统补充提示词
+    let mut scratchpad_with_presets = scratchpad.clone();
+    if !cfg.preset_terms.is_empty() {
+        scratchpad_with_presets.push_str(&format!(
+            "\n\n【行业专用词库（重点识别参考）】：{}",
+            cfg.preset_terms.join("、")
+        ));
+    }
+    if !cfg.preset_prompt.trim().is_empty() {
+        scratchpad_with_presets.push_str(&format!(
+            "\n\n【用户补充指令】：{}",
+            cfg.preset_prompt.trim()
+        ));
+    }
 
     let client = LlmClient::new(cfg.llm.clone(), cfg.egress_policy, store::get_api_key())
         .map_err(err)?;
@@ -1452,7 +1479,7 @@ fn run_summarize(
         meeting_title: &meeting.title,
         meeting_time: &meeting.started_at,
         attendees: &attendees,
-        scratchpad: &scratchpad,
+        scratchpad: &scratchpad_with_presets,
         utterances: &utterances,
     };
     let summarizer = Summarizer {

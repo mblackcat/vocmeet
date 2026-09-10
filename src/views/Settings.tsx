@@ -373,7 +373,6 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
       <div className="doc">
         <div className="meeting-head" id="set-header">
           <h2>设置</h2>
-          <span className="data">这台机器上的事</span>
         </div>
 
         {msg && <div className="msg">{msg}</div>}
