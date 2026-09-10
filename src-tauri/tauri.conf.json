@@ -41,10 +41,7 @@
     },
     "copyright": "",
     "shortDescription": "离线会议纪要",
-    "longDescription": "全量录制、会后本地转写与说话人分离、结合速记生成结构化会议纪要。",
-    "macOS": {
-      "category": "public.app-category.productivity"
-    }
+    "longDescription": "全量录制、会后本地转写与说话人分离、结合速记生成结构化会议纪要。"
   },
   "plugins": {}
 }
