@@ -86,6 +86,19 @@ pub struct DeviceInfo {
     pub is_default: bool,
 }
 
+/// 交错多声道 f32 → 单声道 16k。两个平台采到的原始数据都要过这一步。
+///
+/// 注意 `resample` 每次调用都会新建一个 `SincFixedIn`（sinc_len 256），
+/// 开销不小——调用方必须先攒够一批再调，不要每个回调都来一次。
+fn to_target_pcm(interleaved: &[f32], channels: usize, native_rate: u32) -> Result<Pcm> {
+    let mono = vocmeet_core::audio::downmix(interleaved, channels);
+    let pcm = Pcm {
+        sample_rate: native_rate,
+        samples: mono,
+    };
+    Ok(vocmeet_core::audio::resample_to_target(&pcm)?)
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
@@ -267,12 +280,7 @@ mod windows_impl {
             .chunks_exact(4)
             .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
             .collect();
-        let mono = vocmeet_core::audio::downmix(&interleaved, CAPTURE_CHANNELS);
-        let pcm = Pcm {
-            sample_rate: native_rate as u32,
-            samples: mono,
-        };
-        Ok(vocmeet_core::audio::resample_to_target(&pcm)?)
+        super::to_target_pcm(&interleaved, CAPTURE_CHANNELS, native_rate as u32)
     }
 
     /// 兼容性检查：能否打开系统回环。UI 首启时调用，失败要给出可操作提示。
@@ -401,6 +409,22 @@ pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn to_target_pcm_downmixes_stereo() {
+        // 立体声 [左=1.0,右=0.0] 两帧，已是 16k 无需重采样 → 单声道两个 0.5
+        let interleaved = [1.0f32, 0.0, 1.0, 0.0];
+        let pcm = to_target_pcm(&interleaved, 2, TARGET_SAMPLE_RATE).unwrap();
+        assert_eq!(pcm.sample_rate, TARGET_SAMPLE_RATE);
+        assert_eq!(pcm.samples, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn to_target_pcm_passes_mono_through() {
+        let mono = [0.25f32, -0.25];
+        let pcm = to_target_pcm(&mono, 1, TARGET_SAMPLE_RATE).unwrap();
+        assert_eq!(pcm.samples, vec![0.25, -0.25]);
+    }
 
     #[test]
     fn stop_signal_flips() {
