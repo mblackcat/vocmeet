@@ -12,3 +12,6 @@ serde.workspace = true
 
 [target."cfg(windows)".dependencies]
 wasapi = "0.24"
+
+[target."cfg(target_os = \"macos\")".dependencies]
+cpal.workspace = true

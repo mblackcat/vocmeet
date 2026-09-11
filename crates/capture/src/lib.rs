@@ -368,13 +368,263 @@ mod windows_impl {
     }
 }
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+mod macos_impl {
+    use super::*;
+    use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+    use std::time::{Duration, Instant};
+
+    use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
+    use cpal::{Device, SupportedStreamConfig};
+
+    /// 自检探测时长：够判断有没有信号，又不至于让自检页卡住。
+    const PROBE_MS: u64 = 400;
+
+    /// 每攒够这么多毫秒的原始样本才做一次重采样。
+    /// 不能每个回调都做——`resample` 每次都会新建 sinc_len=256 的重采样器。
+    const BATCH_MS: usize = 250;
+
+    /// 取设备与其默认格式。
+    ///
+    /// 系统轨故意取**输出**设备：cpal 发现该设备 `!supports_input()` 时，
+    /// 会自动建 CoreAudio process tap + 聚合设备来做回环采集。
+    /// 这与 Windows 上「打开 Render 设备、以 Capture 方向初始化」是同一个套路。
+    fn device_for(source: Source) -> Result<(Device, SupportedStreamConfig)> {
+        let host = cpal::default_host();
+        match source {
+            Source::Mic => {
+                let d = host
+                    .default_input_device()
+                    .ok_or_else(|| CaptureError::Device("没有默认输入设备（麦克风）".into()))?;
+                let cfg = d
+                    .default_input_config()
+                    .map_err(|e| CaptureError::Device(format!("读取麦克风默认格式失败：{e}")))?;
+                Ok((d, cfg))
+            }
+            Source::System => {
+                let d = host.default_output_device().ok_or_else(|| {
+                    CaptureError::Device("没有默认输出设备，无法做系统回环".into())
+                })?;
+                let cfg = d.default_output_config().map_err(|e| {
+                    CaptureError::Device(format!("读取输出设备默认格式失败：{e}"))
+                })?;
+                Ok((d, cfg))
+            }
+        }
+    }
+
+    fn describe(d: &Device) -> Option<String> {
+        d.description().ok().map(|desc| desc.name().to_string())
+    }
+
+    pub fn list_devices() -> Result<Vec<DeviceInfo>> {
+        let host = cpal::default_host();
+        let default_in = host.default_input_device().as_ref().and_then(describe);
+        let default_out = host.default_output_device().as_ref().and_then(describe);
+
+        let mut out = Vec::new();
+        for (label, devices, default_name) in [
+            ("输入", host.input_devices().ok(), &default_in),
+            ("输出", host.output_devices().ok(), &default_out),
+        ] {
+            match devices {
+                Some(iter) => {
+                    for d in iter {
+                        if let Some(name) = describe(&d) {
+                            let is_default = default_name.as_deref() == Some(name.as_str());
+                            out.push(DeviceInfo {
+                                name,
+                                direction: label.into(),
+                                is_default,
+                            });
+                        }
+                    }
+                }
+                None => out.push(DeviceInfo {
+                    name: "<枚举失败>".into(),
+                    direction: label.into(),
+                    is_default: false,
+                }),
+            }
+        }
+        Ok(out)
+    }
+
+    /// 把攒够的交错样本转成 16k 单声道并落盘，返回这批的峰值。
+    fn drain_batches(
+        pending: &mut Vec<f32>,
+        batch_samples: usize,
+        channels: usize,
+        native_rate: u32,
+        writer: &mut ChunkWriter,
+    ) -> Result<f32> {
+        let mut peak = 0.0f32;
+        while pending.len() >= batch_samples {
+            let rest = pending.split_off(batch_samples);
+            let batch = std::mem::replace(pending, rest);
+            let pcm = to_target_pcm(&batch, channels, native_rate)?;
+            peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+            writer.push(&pcm.samples)?;
+        }
+        Ok(peak)
+    }
+
+    pub fn capture_track(
+        source: Source,
+        config: &CaptureConfig,
+        stop: &StopSignal,
+    ) -> Result<TrackOutcome> {
+        let (device, dev_cfg) = device_for(source)?;
+        let channels = (dev_cfg.channels() as usize).max(1);
+        let native_rate = dev_cfg.sample_rate();
+
+        let prefix = match source {
+            Source::Mic => "mic",
+            Source::System => "sys",
+        };
+        let mut writer = ChunkWriter::new(
+            &config.out_dir,
+            prefix,
+            TARGET_SAMPLE_RATE,
+            config.chunk_seconds,
+        )?;
+
+        // 回调线程 → 主线程。回调里只做一次拷贝，绝不做重采样或 IO。
+        let (tx, rx): (_, Receiver<Vec<f32>>) = channel();
+        let stream = device
+            .build_input_stream::<f32, _, _>(
+                dev_cfg.config(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    // 主线程提前退出时 send 会失败，忽略即可。
+                    let _ = tx.send(data.to_vec());
+                },
+                |e| tracing::warn!("cpal 采集流错误：{e}"),
+                None,
+            )
+            .map_err(|e| {
+                let what = if source == Source::System {
+                    "系统回环"
+                } else {
+                    "麦克风"
+                };
+                let hint = if source == Source::System {
+                    "。系统回环需要 macOS 14.6 或更高版本"
+                } else {
+                    ""
+                };
+                CaptureError::Stream(format!("打开{what}失败：{e}{hint}"))
+            })?;
+
+        // build_*_stream 返回的流是停止状态，必须 play 才会触发回调。
+        stream
+            .play()
+            .map_err(|e| CaptureError::Stream(format!("启动采集流失败：{e}")))?;
+
+        let batch_samples = (native_rate as usize) * BATCH_MS / 1000 * channels;
+        let mut pending: Vec<f32> = Vec::with_capacity(batch_samples * 2);
+        let mut peak = 0.0f32;
+
+        while !stop.is_stopped() {
+            match rx.recv_timeout(Duration::from_millis(200)) {
+                Ok(buf) => {
+                    pending.extend_from_slice(&buf);
+                    peak = peak.max(drain_batches(
+                        &mut pending,
+                        batch_samples,
+                        channels,
+                        native_rate,
+                        &mut writer,
+                    )?);
+                }
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+
+        // 丢掉流 → 回调不再触发 → tx 被释放 → channel 断开。
+        drop(stream);
+        while let Ok(buf) = rx.try_recv() {
+            pending.extend_from_slice(&buf);
+        }
+        peak = peak.max(drain_batches(
+            &mut pending,
+            batch_samples,
+            channels,
+            native_rate,
+            &mut writer,
+        )?);
+
+        // 落盘尾部不足一批的数据，长度要对齐到声道数。
+        let usable = pending.len() - pending.len() % channels;
+        if usable > 0 {
+            let pcm = to_target_pcm(&pending[..usable], channels, native_rate)?;
+            peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
+            writer.push(&pcm.samples)?;
+        }
+
+        Ok(TrackOutcome {
+            chunks: writer.finish()?,
+            peak,
+        })
+    }
+
+    /// 兼容性检查：能否打开系统回环，以及是否真的采到了声音。
+    ///
+    /// 探测期间恰好没有声音在播放是正常的，所以「没采到」只返回 Ok + 提示，
+    /// 不返回 Err——否则自检页会因为用户当时没放音乐而误报红。
+    pub fn probe_loopback() -> Result<String> {
+        let (device, dev_cfg) = device_for(Source::System)?;
+        let (tx, rx): (_, Receiver<Vec<f32>>) = channel();
+
+        let stream = device
+            .build_input_stream::<f32, _, _>(
+                dev_cfg.config(),
+                move |data: &[f32], _: &cpal::InputCallbackInfo| {
+                    let _ = tx.send(data.to_vec());
+                },
+                |_| {},
+                None,
+            )
+            .map_err(|e| {
+                CaptureError::Stream(format!(
+                    "系统回环不可用：{e}。需要 macOS 14.6 或更高版本，\
+                     且需在「系统设置 → 隐私与安全性 → 系统录音」中允许 VocMeet。"
+                ))
+            })?;
+        stream
+            .play()
+            .map_err(|e| CaptureError::Stream(format!("启动系统回环失败：{e}")))?;
+
+        let deadline = Instant::now() + Duration::from_millis(PROBE_MS);
+        let mut peak = 0.0f32;
+        while Instant::now() < deadline {
+            match rx.recv_timeout(Duration::from_millis(50)) {
+                Ok(buf) => peak = peak.max(buf.iter().fold(0.0f32, |m, s| m.max(s.abs()))),
+                Err(RecvTimeoutError::Timeout) => {}
+                Err(RecvTimeoutError::Disconnected) => break,
+            }
+        }
+        drop(stream);
+
+        if peak < SILENCE_PEAK {
+            Ok(format!(
+                "系统回环能打开，但探测 {PROBE_MS}ms 内没采到任何声音。\
+                 如果当时确实有音频在播放，请检查「系统设置 → 隐私与安全性 → 系统录音」\
+                 是否已勾选 VocMeet——未授权时 macOS 会静默录成空音频。"
+            ))
+        } else {
+            Ok("系统回环可用".to_string())
+        }
+    }
+}
+
+#[cfg(not(any(windows, target_os = "macos")))]
 mod fallback_impl {
     use super::*;
 
     pub fn list_devices() -> Result<Vec<DeviceInfo>> {
         Err(CaptureError::Unsupported(
-            "MVP 仅支持 Windows；macOS 支持见方案 §9 v1.0 路线".into(),
+            "当前平台不支持音频采集（已支持 Windows 与 macOS 14.6+）".into(),
         ))
     }
 
@@ -384,19 +634,24 @@ mod fallback_impl {
         _stop: &StopSignal,
     ) -> Result<TrackOutcome> {
         Err(CaptureError::Unsupported(
-            "MVP 仅支持 Windows 采集".into(),
+            "当前平台不支持音频采集（已支持 Windows 与 macOS 14.6+）".into(),
         ))
     }
 
     pub fn probe_loopback() -> Result<String> {
-        Err(CaptureError::Unsupported("MVP 仅支持 Windows 采集".into()))
+        Err(CaptureError::Unsupported(
+            "当前平台不支持音频采集（已支持 Windows 与 macOS 14.6+）".into(),
+        ))
     }
 }
 
 #[cfg(windows)]
 pub use windows_impl::{capture_track, list_devices, probe_loopback};
 
-#[cfg(not(windows))]
+#[cfg(target_os = "macos")]
+pub use macos_impl::{capture_track, list_devices, probe_loopback};
+
+#[cfg(not(any(windows, target_os = "macos")))]
 pub use fallback_impl::{capture_track, list_devices, probe_loopback};
 
 /// 同时录制双轨，直到 `stop` 被置位。
