@@ -99,6 +99,39 @@ fn to_target_pcm(interleaved: &[f32], channels: usize, native_rate: u32) -> Resu
     Ok(vocmeet_core::audio::resample_to_target(&pcm)?)
 }
 
+/// 低于此峰值视为「全静音」。16bit 量化噪声约 3e-5，取一个略高的门限。
+const SILENCE_PEAK: f32 = 1e-4;
+
+/// 一条轨的采集结果。
+#[derive(Debug, Default)]
+pub struct TrackOutcome {
+    pub chunks: Vec<ChunkInfo>,
+    /// 整条轨的峰值幅度，用于识别「录成功了但全是静音」。
+    pub peak: f32,
+}
+
+/// 判定一条轨是否「录到了分片但全是静音」。
+///
+/// 没录到分片不算——那是设备打不开之类的错误，另有报错路径，
+/// 在这里也报「静音」只会盖住真正的原因。
+fn track_is_silent(peak: f32, chunk_count: usize) -> bool {
+    chunk_count > 0 && peak < SILENCE_PEAK
+}
+
+/// 系统轨全静音时给用户的提示。两个平台的成因不同，给的指引也不同。
+fn silence_warning() -> String {
+    let mut m = String::from("系统音频全程静音，转写会得到空结果。");
+    if cfg!(target_os = "macos") {
+        m.push_str(
+            "若当时确实有声音在播放，请检查「系统设置 → 隐私与安全性 → 系统录音」\
+             是否已勾选 VocMeet——未授权时 macOS 会静默录成空音频，既不报错也不弹窗。",
+        );
+    } else {
+        m.push_str("常见原因：输出设备被其他程序独占，或录制期间确实没有声音播放。");
+    }
+    m
+}
+
 #[cfg(windows)]
 mod windows_impl {
     use super::*;
@@ -162,7 +195,7 @@ mod windows_impl {
         source: Source,
         config: &CaptureConfig,
         stop: &StopSignal,
-    ) -> Result<Vec<ChunkInfo>> {
+    ) -> Result<TrackOutcome> {
         initialize_mta()
             .ok()
             .map_err(|e| CaptureError::Device(format!("COM 初始化失败: {e}")))?;
@@ -233,6 +266,7 @@ mod windows_impl {
         )?;
 
         let mut raw: VecDeque<u8> = VecDeque::new();
+        let mut peak = 0.0f32;
         client
             .start_stream()
             .map_err(|e| CaptureError::Stream(format!("启动流: {e}")))?;
@@ -255,6 +289,7 @@ mod windows_impl {
             while raw.len() >= batch_bytes {
                 let bytes: Vec<u8> = raw.drain(..batch_bytes).collect();
                 let pcm = decode_and_downsample(&bytes, native_rate)?;
+                peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
                 writer.push(&pcm.samples)?;
             }
         }
@@ -267,11 +302,15 @@ mod windows_impl {
             let usable = bytes.len() - bytes.len() % blockalign;
             if usable > 0 {
                 let pcm = decode_and_downsample(&bytes[..usable], native_rate)?;
+                peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
                 writer.push(&pcm.samples)?;
             }
         }
 
-        Ok(writer.finish()?)
+        Ok(TrackOutcome {
+            chunks: writer.finish()?,
+            peak,
+        })
     }
 
     /// 原始字节 → f32 交错 → 降混单声道 → 重采样到 16k。
@@ -343,7 +382,7 @@ mod fallback_impl {
         _source: Source,
         _config: &CaptureConfig,
         _stop: &StopSignal,
-    ) -> Result<Vec<ChunkInfo>> {
+    ) -> Result<TrackOutcome> {
         Err(CaptureError::Unsupported(
             "MVP 仅支持 Windows 采集".into(),
         ))
@@ -390,14 +429,19 @@ pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Re
     // 任一轨失败不应让整场录制丢失——另一轨的数据仍然有价值。
     if let Some(h) = mic_handle {
         match h.join() {
-            Ok(Ok(chunks)) => out.mic_chunks = chunks,
+            Ok(Ok(t)) => out.mic_chunks = t.chunks,
             Ok(Err(e)) => out.warnings.push(format!("麦克风轨失败：{e}")),
             Err(_) => out.warnings.push("麦克风轨线程 panic".into()),
         }
     }
     if let Some(h) = sys_handle {
         match h.join() {
-            Ok(Ok(chunks)) => out.system_chunks = chunks,
+            Ok(Ok(t)) => {
+                if track_is_silent(t.peak, t.chunks.len()) {
+                    out.warnings.push(silence_warning());
+                }
+                out.system_chunks = t.chunks;
+            }
             Ok(Err(e)) => out.warnings.push(format!("系统回环轨失败：{e}")),
             Err(_) => out.warnings.push("系统回环轨线程 panic".into()),
         }
@@ -409,6 +453,27 @@ pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn silent_track_is_flagged_only_when_it_recorded_something() {
+        // 录到了分片但峰值为 0 → 判静音
+        assert!(track_is_silent(0.0, 3));
+        // 有信号 → 不判
+        assert!(!track_is_silent(0.5, 3));
+        // 压根没录到分片是另一类错误（设备打不开），不该报「静音」
+        assert!(!track_is_silent(0.0, 0));
+        // 阈值边界：等于阈值不算静音
+        assert!(!track_is_silent(SILENCE_PEAK, 1));
+    }
+
+    #[test]
+    fn silence_warning_points_at_the_actual_fix() {
+        let w = silence_warning();
+        assert!(w.contains("静音"), "要说清现象");
+        if cfg!(target_os = "macos") {
+            assert!(w.contains("系统录音"), "macOS 上必须指向权限设置项");
+        }
+    }
 
     #[test]
     fn to_target_pcm_downmixes_stereo() {
