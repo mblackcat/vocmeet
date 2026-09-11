@@ -14,7 +14,7 @@ MVP 分三层交付，各层验证程度不同——下表是实事求是的状�
 | 组件 | 状态 | 验证方式 |
 | :--- | :--- | :--- |
 | `crates/core` 核心库 | ✅ 可用 | 94 个单元测试通过 |
-| `crates/capture` 音频采集 | ✅ 可用（Windows） | 4 个单元测试 + 本机实录双轨 8 秒通过 |
+| `crates/capture` 音频采集 | ✅ 可用（Windows / macOS 14.6+） | 8 个单元测试；Windows 实录双轨 8 秒、macOS 实录双轨 12 秒均通过 |
 | `crates/cli` 命令行 | ✅ 可用 | 全链路手工验证，详见方案文档 §14.3 |
 | `src-tauri` + React 桌面 GUI | ⚠️ 可启动，交互未验证 | 编译通过、进程实启存活、安装包已产出；**UI 未做人工点击验证** |
 
@@ -36,10 +36,25 @@ GUI 已实现并能打出安装包（Windows：MSI / NSIS；macOS：app / dmg，
 下完自动生效，不用手动指目录。没有网络或者已经有一套权重的话，
 也可以跑 `scripts/fetch-models.sh`，再用「已经有了，指个目录」指过去。
 
-**已知限制（macOS）**：音频采集（`crates/capture`）目前仅实现了 Windows（WASAPI），macOS 原生
-采集是方案 §9 里 MVP 之后才做的工作。「录制」页在 macOS 上会明确提示「平台不支持」，
-其余功能（导入音频、逐字稿、纪要、设置、自检）不受影响。安装包未签名公证，首次打开需要
-`xattr -dr com.apple.quarantine /Applications/VocMeet.app` 放行。
+**macOS 采集须知**：系统音频采集走 CoreAudio process tap（经 cpal），**需要 macOS 14.6 或更高版本**；
+低于该版本时「录制」页会明确报错，导入音频、逐字稿、纪要等其余功能不受影响。
+
+首次录制前请确认两项权限，否则会静默录出空音频：
+
+| 权限 | 位置 | 不给的后果 |
+| :--- | :--- | :--- |
+| 麦克风 | 系统设置 → 隐私与安全性 → 麦克风 | 麦克风轨为空 |
+| 系统录音 | 系统设置 → 隐私与安全性 → 系统录音 | **系统轨静默录成空音频，不报错也不弹窗** |
+
+「系统录音」这条是 macOS 的一个坑：权限没给时 CoreAudio 照样把流开起来，只是录到的全是静音。
+VocMeet 会在录制结束后检查系统轨，没采到声音时给出明确警告并指向上面这个设置项；
+自检页的「系统回环」一行也会如实区分「打不开」和「能打开但没采到声音」。
+
+还有一条只在**首次**录制时出现的现象：第一次访问麦克风要过系统的权限检查，
+那一次麦克风轨会比系统轨短 3 秒左右（实测 8.570s vs 11.748s）。之后每次录制都稳定在 25ms 以内。
+重要的会议建议先空录几秒，把这一次性开销跑掉。
+
+安装包未签名公证，首次打开需要 `xattr -dr com.apple.quarantine /Applications/VocMeet.app` 放行。
 
 界面分五页：**录制**（开始/停止、会中速记 Scratchpad、发起转写并看进度）、
 **逐字稿**（说话人命名、低置信片段高亮、就地校对、导出）、
@@ -115,8 +130,8 @@ ogg / oga    mka / webm   aiff / aif / aifc   caf
 
 ### 依赖
 
-- Windows 10/11（采集层仅支持 Windows；macOS 见方案 §9）
-- Rust stable（MSVC toolchain）
+- Windows 10/11，或 macOS 14.6+（采集层支持这两个平台）
+- Rust stable（Windows 上需 MSVC toolchain）
 - 约 600MB 磁盘（ONNX 权重）
 
 ### 构建
@@ -199,7 +214,7 @@ ollama pull qwen2.5:7b
 vocmeet/
 ├─ crates/
 │  ├─ core/         核心库：audio / asr / align / store / llm / summarize / policy / jobs
-│  ├─ capture/      Windows WASAPI 双轨采集
+│  ├─ capture/      双轨采集：Windows WASAPI / macOS CoreAudio tap
 │  └─ cli/          命令行入口
 ├─ src-tauri/       Tauri 后端：命令层与事件推送
 ├─ src/             React 前端：录制 / 逐字稿 / 纪要 / 设置 / 自检
