@@ -323,7 +323,7 @@ mod windows_impl {
     }
 
     /// 兼容性检查：能否打开系统回环。UI 首启时调用，失败要给出可操作提示。
-    pub fn probe_loopback() -> Result<()> {
+    pub fn probe_loopback() -> Result<String> {
         initialize_mta()
             .ok()
             .map_err(|e| CaptureError::Device(format!("COM 初始化失败: {e}")))?;
@@ -364,7 +364,7 @@ mod windows_impl {
                 ))
             })?;
         let _ = ShareMode::Shared; // 明确我们只用共享模式
-        Ok(())
+        Ok("系统回环可用".to_string())
     }
 }
 
@@ -388,7 +388,7 @@ mod fallback_impl {
         ))
     }
 
-    pub fn probe_loopback() -> Result<()> {
+    pub fn probe_loopback() -> Result<String> {
         Err(CaptureError::Unsupported("MVP 仅支持 Windows 采集".into()))
     }
 }

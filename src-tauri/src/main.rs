@@ -166,7 +166,7 @@ fn doctor(state: State<AppState>) -> R<DoctorReport> {
     };
 
     let (loopback_ok, loopback_message) = match vocmeet_capture::probe_loopback() {
-        Ok(()) => (true, "系统回环可用".to_string()),
+        Ok(msg) => (true, msg),
         Err(e) => (false, e.to_string()),
     };
 

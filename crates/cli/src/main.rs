@@ -194,7 +194,7 @@ fn devices() -> Result<()> {
     println!();
     print!("系统回环探测：");
     match vocmeet_capture::probe_loopback() {
-        Ok(()) => println!("可用"),
+        Ok(msg) => println!("{msg}"),
         Err(e) => println!("不可用 —— {e}"),
     }
     Ok(())
