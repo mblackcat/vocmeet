@@ -110,17 +110,19 @@ pub struct TrackOutcome {
     pub peak: f32,
 }
 
-/// 判定一条轨是否「录到了分片但全是静音」。
+/// 判定系统轨是否「没录到有效声音」。两种形态都要告警：
 ///
-/// 没录到分片不算——那是设备打不开之类的错误，另有报错路径，
-/// 在这里也报「静音」只会盖住真正的原因。
-fn track_is_silent(peak: f32, chunk_count: usize) -> bool {
-    chunk_count > 0 && peak < SILENCE_PEAK
+/// - **有分片但全是零**：权限缺失时的典型表现，流开得好好的，内容全是静音。
+/// - **一个分片都没有**：macOS 实测——CoreAudio 的 process tap 在完全没有音频
+///   流过时根本不触发回调，连文件都不会生成。这条路径不抛任何 Err，
+///   不在这里兜住的话，用户只会拿到一场空录音而得不到任何提示。
+fn system_track_has_no_audio(peak: f32, chunk_count: usize) -> bool {
+    chunk_count == 0 || peak < SILENCE_PEAK
 }
 
-/// 系统轨全静音时给用户的提示。两个平台的成因不同，给的指引也不同。
+/// 系统轨没录到声音时给用户的提示。两个平台的成因不同，给的指引也不同。
 fn silence_warning() -> String {
-    let mut m = String::from("系统音频全程静音，转写会得到空结果。");
+    let mut m = String::from("系统音频没有录到任何声音，转写会得到空结果。");
     if cfg!(target_os = "macos") {
         m.push_str(
             "若当时确实有声音在播放，请检查「系统设置 → 隐私与安全性 → 系统录音」\
@@ -692,7 +694,7 @@ pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Re
     if let Some(h) = sys_handle {
         match h.join() {
             Ok(Ok(t)) => {
-                if track_is_silent(t.peak, t.chunks.len()) {
+                if system_track_has_no_audio(t.peak, t.chunks.len()) {
                     out.warnings.push(silence_warning());
                 }
                 out.system_chunks = t.chunks;
@@ -710,21 +712,24 @@ mod tests {
     use super::*;
 
     #[test]
-    fn silent_track_is_flagged_only_when_it_recorded_something() {
-        // 录到了分片但峰值为 0 → 判静音
-        assert!(track_is_silent(0.0, 3));
+    fn system_track_without_audio_is_flagged() {
+        // 有分片但峰值为 0：权限缺失时的典型表现
+        assert!(system_track_has_no_audio(0.0, 3));
+        // 一个分片都没有：macOS 实测——CoreAudio 的 tap 在完全没有音频流过时
+        // 根本不触发回调，于是连文件都不会生成。这条路径没有任何 Err 会被抛出，
+        // 不在这里告警的话用户就只能得到一场空录音而毫无提示。
+        assert!(system_track_has_no_audio(0.0, 0));
         // 有信号 → 不判
-        assert!(!track_is_silent(0.5, 3));
-        // 压根没录到分片是另一类错误（设备打不开），不该报「静音」
-        assert!(!track_is_silent(0.0, 0));
+        assert!(!system_track_has_no_audio(0.5, 3));
         // 阈值边界：等于阈值不算静音
-        assert!(!track_is_silent(SILENCE_PEAK, 1));
+        assert!(!system_track_has_no_audio(SILENCE_PEAK, 1));
     }
 
     #[test]
     fn silence_warning_points_at_the_actual_fix() {
         let w = silence_warning();
-        assert!(w.contains("静音"), "要说清现象");
+        assert!(w.contains("没有录到"), "要说清现象");
+        assert!(w.contains("空结果"), "要说清后果");
         if cfg!(target_os = "macos") {
             assert!(w.contains("系统录音"), "macOS 上必须指向权限设置项");
         }
