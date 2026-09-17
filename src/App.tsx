@@ -311,9 +311,16 @@ export default function App() {
 
   return (
     <div className="shell">
+      {/* 原生标题栏已隐藏（titleBarStyle: Overlay），窗口得自己给出可拖动的地方。
+          这条贯穿顶部的透明带就是拖拽区；它压在 .rail-head 上方，
+          而 .rail-head 已经下移让开了红绿灯，所以不会挡住任何按钮。 */}
+      <div className="titlebar-drag" data-tauri-drag-region />
       <aside className="rail">
         <div className="rail-head">
-          <div className="rail-brand">
+          {/* 品牌区本身不可交互，顺带也做成拖拽区。
+              不要把 data-tauri-drag-region 加到 .rail-head 上——
+              那会把右边 .rail-head-actions 里的两个按钮一起吞掉。 */}
+          <div className="rail-brand" data-tauri-drag-region>
             <img src="/logo.png" alt="VocMeet" className="rail-brand-logo" />
             <h1>VocMeet</h1>
           </div>

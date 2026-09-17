@@ -100,7 +100,108 @@ fn to_target_pcm(interleaved: &[f32], channels: usize, native_rate: u32) -> Resu
 }
 
 /// 低于此峰值视为「全静音」。16bit 量化噪声约 3e-5，取一个略高的门限。
-const SILENCE_PEAK: f32 = 1e-4;
+///
+/// 注意这个门限是照着**重采样后**的 16k 单声道信号调的（见 `drain_batches`）。
+/// 实时电平表取的是重采样前的交织样本，两者在门限附近并不等价，不要混用。
+pub const SILENCE_PEAK: f32 = 1e-4;
+
+/// 一次实时电平采样。`rms` 驱动波形高度，`peak` 留给削波提示。
+///
+/// 取自**重采样前**的设备原始样本——重采样要攒满 250ms 一批（`BATCH_MS`）才做，
+/// 对电平表来说既太粗也太突兀。代价是与 `TrackOutcome::peak` 的口径不同，见 `SILENCE_PEAK`。
+#[derive(Debug, Clone, Copy)]
+pub struct LevelSample {
+    pub source: Source,
+    pub rms: f32,
+    pub peak: f32,
+}
+
+/// 实时电平回调。在采集线程内同步调用，必须廉价且绝不阻塞。
+pub type LevelSink = Arc<dyn Fn(LevelSample) + Send + Sync>;
+
+/// 实时电平的推送间隔。20 Hz——够顺滑，又不会打爆 Tauri 的 IPC 桥。
+const LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 算一批交织样本的 rms 与峰值。空输入返回全零而不是 NaN。
+fn level_of(buf: &[f32]) -> (f32, f32) {
+    if buf.is_empty() {
+        return (0.0, 0.0);
+    }
+    let mut sum_sq = 0.0f64;
+    let mut peak = 0.0f32;
+    for &s in buf {
+        sum_sq += (s as f64) * (s as f64);
+        peak = peak.max(s.abs());
+    }
+    ((sum_sq / buf.len() as f64).sqrt() as f32, peak)
+}
+
+/// 攒够 `LEVEL_INTERVAL` 再推一次电平，避免每个设备回调都发一条事件。
+struct LevelMeter<'a> {
+    sink: Option<&'a LevelSink>,
+    source: Source,
+    last: std::time::Instant,
+    sum_sq: f64,
+    count: usize,
+    peak: f32,
+}
+
+impl<'a> LevelMeter<'a> {
+    fn new(sink: Option<&'a LevelSink>, source: Source) -> Self {
+        Self {
+            sink,
+            source,
+            last: std::time::Instant::now(),
+            sum_sq: 0.0,
+            count: 0,
+            peak: 0.0,
+        }
+    }
+
+    /// 吃进一批原始样本。到点了就推一次并清空累积。
+    fn push(&mut self, buf: &[f32]) {
+        let Some(sink) = self.sink else { return };
+        let (rms, peak) = level_of(buf);
+        self.sum_sq += (rms as f64) * (rms as f64) * buf.len() as f64;
+        self.count += buf.len();
+        self.peak = self.peak.max(peak);
+
+        if self.last.elapsed() < LEVEL_INTERVAL {
+            return;
+        }
+        let rms = if self.count == 0 {
+            0.0
+        } else {
+            (self.sum_sq / self.count as f64).sqrt() as f32
+        };
+        sink(LevelSample {
+            source: self.source,
+            rms,
+            peak: self.peak,
+        });
+        self.last = std::time::Instant::now();
+        self.sum_sq = 0.0;
+        self.count = 0;
+        self.peak = 0.0;
+    }
+
+    /// 没有数据流过时也要按节奏推零，否则 UI 分不清「静音」和「卡住了」。
+    fn tick_idle(&mut self) {
+        let Some(sink) = self.sink else { return };
+        if self.last.elapsed() < LEVEL_INTERVAL {
+            return;
+        }
+        sink(LevelSample {
+            source: self.source,
+            rms: 0.0,
+            peak: 0.0,
+        });
+        self.last = std::time::Instant::now();
+        self.sum_sq = 0.0;
+        self.count = 0;
+        self.peak = 0.0;
+    }
+}
 
 /// 一条轨的采集结果。
 #[derive(Debug, Default)]
@@ -121,7 +222,9 @@ fn system_track_has_no_audio(peak: f32, chunk_count: usize) -> bool {
 }
 
 /// 系统轨没录到声音时给用户的提示。两个平台的成因不同，给的指引也不同。
-fn silence_warning() -> String {
+///
+/// 录制结束后的告警与录制中的实时告警共用这一份文案，避免两处说法不一致。
+pub fn silence_warning() -> String {
     let mut m = String::from("系统音频没有录到任何声音，转写会得到空结果。");
     if cfg!(target_os = "macos") {
         m.push_str(
@@ -197,6 +300,7 @@ mod windows_impl {
         source: Source,
         config: &CaptureConfig,
         stop: &StopSignal,
+        level: Option<&LevelSink>,
     ) -> Result<TrackOutcome> {
         initialize_mta()
             .ok()
@@ -269,6 +373,7 @@ mod windows_impl {
 
         let mut raw: VecDeque<u8> = VecDeque::new();
         let mut peak = 0.0f32;
+        let mut meter = LevelMeter::new(level, source);
         client
             .start_stream()
             .map_err(|e| CaptureError::Stream(format!("启动流: {e}")))?;
@@ -276,14 +381,31 @@ mod windows_impl {
         while !stop.is_stopped() {
             // 事件超时不致命：静音时设备可能长时间不产生数据。
             if event.wait_for_event(1_000).is_err() {
+                meter.tick_idle();
                 continue;
             }
             let frames = capture_client.get_next_packet_size().unwrap_or(None).unwrap_or(0);
             if frames == 0 {
+                meter.tick_idle();
                 continue;
             }
+            let before = raw.len();
             if capture_client.read_from_device_to_deque(&mut raw).is_err() {
                 continue;
+            }
+
+            // 电平取本次新读到的原始样本，不等 250ms 那一批——否则表针只有 4Hz。
+            // 多一次拷贝，但 packet 只有 10ms 级别，代价可忽略。
+            if level.is_some() && raw.len() > before {
+                let fresh: Vec<f32> = raw
+                    .iter()
+                    .skip(before)
+                    .copied()
+                    .collect::<Vec<u8>>()
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                meter.push(&fresh);
             }
 
             // 攒够一批再转换，避免每个 packet 都过一次重采样器。
@@ -475,6 +597,7 @@ mod macos_impl {
         source: Source,
         config: &CaptureConfig,
         stop: &StopSignal,
+        level: Option<&LevelSink>,
     ) -> Result<TrackOutcome> {
         let (device, dev_cfg) = device_for(source)?;
         let channels = (dev_cfg.channels() as usize).max(1);
@@ -525,10 +648,13 @@ mod macos_impl {
         let batch_samples = (native_rate as usize) * BATCH_MS / 1000 * channels;
         let mut pending: Vec<f32> = Vec::with_capacity(batch_samples * 2);
         let mut peak = 0.0f32;
+        let mut meter = LevelMeter::new(level, source);
 
         while !stop.is_stopped() {
             match rx.recv_timeout(Duration::from_millis(200)) {
                 Ok(buf) => {
+                    // 电平走重采样前的原始样本，与下面的 peak 折叠是两套口径，别合并。
+                    meter.push(&buf);
                     pending.extend_from_slice(&buf);
                     peak = peak.max(drain_batches(
                         &mut pending,
@@ -538,7 +664,9 @@ mod macos_impl {
                         &mut writer,
                     )?);
                 }
-                Err(RecvTimeoutError::Timeout) => {}
+                // 超时说明这段时间一个回调都没来。macOS 上完全没有音频流过时
+                // process tap 根本不触发回调，这里要照常推零，UI 才能画出那条直线。
+                Err(RecvTimeoutError::Timeout) => meter.tick_idle(),
                 Err(RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -634,6 +762,7 @@ mod fallback_impl {
         _source: Source,
         _config: &CaptureConfig,
         _stop: &StopSignal,
+        _level: Option<&LevelSink>,
     ) -> Result<TrackOutcome> {
         Err(CaptureError::Unsupported(
             "当前平台不支持音频采集（已支持 Windows 与 macOS 14.6+）".into(),
@@ -661,13 +790,25 @@ pub use fallback_impl::{capture_track, list_devices, probe_loopback};
 /// 两条轨各起一个线程——它们的设备时钟不同步，必须独立驱动。
 /// 时间轴对齐依赖两者近似同时 start，误差目标 <200ms（§8.1 W2–W3 出口标准）。
 pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Recording> {
+    record_dual_track_with_levels(config, stop, None)
+}
+
+/// 与 `record_dual_track` 相同，但额外把实时电平推给 `level`。
+///
+/// GUI 用它画录制中的双轨波形；CLI 不需要，走上面那个薄包装即可。
+pub fn record_dual_track_with_levels(
+    config: &CaptureConfig,
+    stop: &StopSignal,
+    level: Option<LevelSink>,
+) -> Result<Recording> {
     let mut out = Recording::default();
 
     let mic_handle = if config.record_mic {
         let cfg = config.clone();
         let s = stop.clone();
+        let lv = level.clone();
         Some(std::thread::spawn(move || {
-            capture_track(Source::Mic, &cfg, &s)
+            capture_track(Source::Mic, &cfg, &s, lv.as_ref())
         }))
     } else {
         None
@@ -676,8 +817,9 @@ pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Re
     let sys_handle = if config.record_system {
         let cfg = config.clone();
         let s = stop.clone();
+        let lv = level.clone();
         Some(std::thread::spawn(move || {
-            capture_track(Source::System, &cfg, &s)
+            capture_track(Source::System, &cfg, &s, lv.as_ref())
         }))
     } else {
         None
@@ -742,6 +884,75 @@ mod tests {
         let pcm = to_target_pcm(&interleaved, 2, TARGET_SAMPLE_RATE).unwrap();
         assert_eq!(pcm.sample_rate, TARGET_SAMPLE_RATE);
         assert_eq!(pcm.samples, vec![0.5, 0.5]);
+    }
+
+    #[test]
+    fn level_of_computes_rms_and_peak() {
+        // 满幅方波：每个样本绝对值都是 1，rms 也是 1
+        let (rms, peak) = level_of(&[1.0, -1.0, 1.0, -1.0]);
+        assert!((rms - 1.0).abs() < 1e-6, "rms={rms}");
+        assert!((peak - 1.0).abs() < 1e-6, "peak={peak}");
+
+        // rms 是均方根而不是平均绝对值：[1,0] 应得 1/√2 ≈ 0.7071，不是 0.5
+        let (rms, peak) = level_of(&[1.0, 0.0]);
+        assert!((rms - std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-6, "rms={rms}");
+        assert!((peak - 1.0).abs() < 1e-6);
+
+        // 全静音
+        let (rms, peak) = level_of(&[0.0; 8]);
+        assert_eq!((rms, peak), (0.0, 0.0));
+    }
+
+    #[test]
+    fn level_of_handles_empty_without_nan() {
+        // 空输入不能返回 NaN——那会经 serde 变成 JSON 的 null 并让前端画出空洞。
+        let (rms, peak) = level_of(&[]);
+        assert!(rms.is_finite() && peak.is_finite());
+        assert_eq!((rms, peak), (0.0, 0.0));
+    }
+
+    #[test]
+    fn level_meter_is_inert_without_a_sink() {
+        // 没接 sink 时（CLI 路径）不该有任何开销或 panic
+        let mut m = LevelMeter::new(None, Source::Mic);
+        m.push(&[1.0, -1.0]);
+        m.tick_idle();
+    }
+
+    #[test]
+    fn level_meter_emits_on_the_configured_interval() {
+        use std::sync::atomic::AtomicUsize;
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h = hits.clone();
+        let sink: LevelSink = Arc::new(move |s: LevelSample| {
+            assert!(s.rms.is_finite() && s.peak.is_finite());
+            h.fetch_add(1, Ordering::Relaxed);
+        });
+
+        let mut m = LevelMeter::new(Some(&sink), Source::System);
+        // 刚建好就推，还没到间隔 → 不发
+        m.push(&[0.5; 16]);
+        assert_eq!(hits.load(Ordering::Relaxed), 0);
+
+        std::thread::sleep(LEVEL_INTERVAL + std::time::Duration::from_millis(5));
+        m.push(&[0.5; 16]);
+        assert_eq!(hits.load(Ordering::Relaxed), 1, "过了间隔应该发一次");
+    }
+
+    #[test]
+    fn level_metering_does_not_touch_the_silence_threshold_signal() {
+        // 回归锁：静音判定读的是 downmix + 重采样**之后**的信号，
+        // 电平表读的是之前的交织原始样本。硬声像立体声在两处的读数天然不同，
+        // 谁要是图省事把两者并成一套，这个断言会先炸。
+        let interleaved = [1.0f32, 0.0, 1.0, 0.0]; // 左满幅、右静音
+        let (_, meter_peak) = level_of(&interleaved);
+        let post = to_target_pcm(&interleaved, 2, TARGET_SAMPLE_RATE).unwrap();
+        let silence_peak = post.samples.iter().fold(0.0f32, |m, s| m.max(s.abs()));
+
+        assert!((meter_peak - 1.0).abs() < 1e-6, "电平表看到的是原始幅度");
+        assert!((silence_peak - 0.5).abs() < 1e-6, "静音判定看到的是 downmix 后的幅度");
+        assert!(meter_peak > silence_peak, "两套口径不可互换");
     }
 
     #[test]

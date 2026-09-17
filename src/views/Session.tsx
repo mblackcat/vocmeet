@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, asMessage, events } from "../api";
-import type { ProcessEvent } from "../types";
+import type { ProcessEvent, TrackSource } from "../types";
 
 interface Props {
   liveId: number | null;
@@ -23,6 +23,49 @@ interface Jot {
 }
 
 const BARS = 13;
+
+/** 电平表保留多少格历史。20Hz 下 48 格约 2.4 秒，读起来是一段音轨而不是跳动的柱子。 */
+const METER_SLOTS = 48;
+
+/** 两条轨的显示顺序与标签。 */
+const TRACKS: Array<{ key: TrackSource; label: string }> = [
+  { key: "Mic", label: "麦克风" },
+  { key: "System", label: "系统" },
+];
+
+/**
+ * rms → 条形高度（0..1）。
+ *
+ * 线性映射在会议语音这种小信号上几乎看不出动静——人耳是对数的，表也得是。
+ * -60dB 铺满整个高度，低于这个当静音。
+ */
+function toHeight(rms: number): number {
+  if (!(rms > 0)) return 0;
+  const db = 20 * Math.log10(rms);
+  return Math.min(1, Math.max(0, (db + 60) / 60));
+}
+
+/** 一条轨的滚动波形。高度由 rAF 直接写 DOM，不走 state——20Hz×2 轨的 setState 会把主线程拖垮。 */
+function TrackMeter({
+  label,
+  silent,
+  barsRef,
+}: {
+  label: string;
+  silent: boolean;
+  barsRef: (el: HTMLDivElement | null) => void;
+}) {
+  return (
+    <div className={silent ? "meter-row silent" : "meter-row"}>
+      <span className="meter-label">{label}</span>
+      <div className="meter-bars" ref={barsRef} aria-hidden>
+        {Array.from({ length: METER_SLOTS }, (_, i) => (
+          <span key={i} />
+        ))}
+      </div>
+    </div>
+  );
+}
 
 const NL = String.fromCharCode(10);
 const pad2 = (n: number) => String(Math.floor(n)).padStart(2, "0");
@@ -62,7 +105,16 @@ export default function Session({
   const [step, setStep] = useState<ProcessEvent | null>(null);
   /** 转写阶段的细粒度进度，来自引擎自己的 stage 事件。 */
   const [asr, setAsr] = useState<number | null>(null);
+  /** 录制中的告警（目前只有系统轨静音）。后端判定，前端只负责显示。 */
+  const [warning, setWarning] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
+
+  /** 每轨的电平历史，最新的在末尾。存 ref 不存 state。 */
+  const history = useRef<Record<TrackSource, number[]>>({ Mic: [], System: [] });
+  const barsEl = useRef<Record<TrackSource, HTMLDivElement | null>>({
+    Mic: null,
+    System: null,
+  });
 
   const recording = liveId !== null;
   const processing = busyId !== null;
@@ -77,8 +129,45 @@ export default function Session({
       })
       .then((f) => off.push(f));
     void events.onTranscribeProgress((e) => setAsr(e.progress)).then((f) => off.push(f));
+    void events
+      .onRecordingLevel((e) => {
+        const h = history.current[e.source];
+        if (!h) return;
+        h.push(toHeight(e.rms));
+        if (h.length > METER_SLOTS) h.splice(0, h.length - METER_SLOTS);
+      })
+      .then((f) => off.push(f));
+    void events.onRecordingWarning((e) => setWarning(e.message)).then((f) => off.push(f));
     return () => off.forEach((f) => f());
   }, []);
+
+  // 录制期间把电平历史刷到 DOM。挂 rAF 而不是 setState：
+  // 20Hz × 2 轨 = 每秒 40 次重渲染，够把主线程拖出掉帧。
+  useEffect(() => {
+    if (!recording) {
+      history.current = { Mic: [], System: [] };
+      setWarning(null);
+      return;
+    }
+    let raf = 0;
+    const paint = () => {
+      for (const { key } of TRACKS) {
+        const el = barsEl.current[key];
+        if (!el) continue;
+        const h = history.current[key];
+        const spans = el.children;
+        // 历史右对齐：最新的一格永远在最右边，左边不够就留空。
+        const offset = METER_SLOTS - h.length;
+        for (let i = 0; i < spans.length; i++) {
+          const v = i < offset ? 0 : h[i - offset];
+          (spans[i] as HTMLElement).style.height = `${Math.max(2, v * 100)}%`;
+        }
+      }
+      raf = requestAnimationFrame(paint);
+    };
+    raf = requestAnimationFrame(paint);
+    return () => cancelAnimationFrame(raf);
+  }, [recording]);
 
   useEffect(() => {
     bottom.current?.scrollIntoView({ behavior: "smooth" });
@@ -206,11 +295,19 @@ export default function Session({
             <div className="title-input" style={{ pointerEvents: "none" }}>
               {liveTitle || "未命名会议"}
             </div>
-            <div className="wave" aria-hidden>
-              {Array.from({ length: BARS }, (_, i) => (
-                <span key={i} style={{ animationDelay: `${i * 70}ms` }} />
+            <div className="meter">
+              {TRACKS.map((t) => (
+                <TrackMeter
+                  key={t.key}
+                  label={t.label}
+                  silent={t.key === "System" && warning !== null}
+                  barsRef={(el) => {
+                    barsEl.current[t.key] = el;
+                  }}
+                />
               ))}
             </div>
+            {warning && <p className="meter-warn">{warning}</p>}
             <div className="elapsed">{clock}</div>
             <button className="record stop" onClick={() => void end()}>
               <span className="disc"><i /></span>

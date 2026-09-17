@@ -9,7 +9,9 @@
 //! - 录制状态（StopSignal）是唯一需要跨命令共享的可变状态。
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
@@ -33,6 +35,10 @@ struct RecordingSession {
     meeting_id: i64,
     stop: vocmeet_capture::StopSignal,
     handle: std::thread::JoinHandle<vocmeet_capture::Result<vocmeet_capture::Recording>>,
+    /// 静音看门狗。必须与采集线程分开停——它靠挂钟判断，
+    /// 而「一个回调都没来」正是它要抓的情况，不能由数据驱动。
+    watchdog_stop: Arc<AtomicBool>,
+    watchdog: Option<std::thread::JoinHandle<()>>,
 }
 
 struct AppState {
@@ -271,8 +277,28 @@ fn delete_meeting(state: State<AppState>, meeting_id: i64) -> R<()> {
 
 // ---------------------------------------------------------------- 命令：录制
 
+/// 推给前端的实时电平。每轨约 20 Hz。
+#[derive(Serialize, Clone)]
+struct LevelEvent {
+    /// "Mic" 或 "System"，与 `vocmeet_core::Source` 的 Debug 名对齐。
+    source: String,
+    rms: f32,
+    peak: f32,
+}
+
+/// 录制过程中的告警。目前只有系统轨静音一种。
+#[derive(Serialize, Clone)]
+struct RecordingWarningEvent {
+    meeting_id: i64,
+    kind: String,
+    message: String,
+}
+
+/// 系统轨静默多久就告警。够长以躲开会议开场的安静，又远短于一场会。
+const SILENCE_ALERT_AFTER: Duration = Duration::from_secs(10);
+
 #[tauri::command]
-fn start_recording(state: State<AppState>, title: String) -> R<i64> {
+fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i64> {
     {
         let guard = state.recording.lock().map_err(|_| "录制锁中毒")?;
         if guard.is_some() {
@@ -287,25 +313,87 @@ fn start_recording(state: State<AppState>, title: String) -> R<i64> {
         .map_err(err)?;
 
     let out_dir = cfg.audio_dir().join(format!("meeting_{meeting_id}"));
+    let record_system = cfg.capture.record_system;
     let capture_cfg = vocmeet_capture::CaptureConfig {
         out_dir,
         chunk_seconds: cfg.capture.chunk_seconds,
         min_free_bytes: cfg.capture.min_free_bytes,
         record_mic: cfg.capture.record_mic,
-        record_system: cfg.capture.record_system,
+        record_system,
     };
+
+    // 系统轨最后一次听到声音的时刻，以录制开始为 0 点，单位毫秒。
+    // 看门狗线程读它，采集线程写它——用原子量而不是锁，免得拖慢采集回调。
+    let started = Instant::now();
+    let last_audio_ms = Arc::new(AtomicU64::new(0));
+
+    let level_app = app.clone();
+    let level_seen = last_audio_ms.clone();
+    let sink: vocmeet_capture::LevelSink = Arc::new(move |s: vocmeet_capture::LevelSample| {
+        if s.source == vocmeet_core::Source::System && s.peak >= vocmeet_capture::SILENCE_PEAK {
+            level_seen.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        }
+        let _ = level_app.emit(
+            "recording-level",
+            LevelEvent {
+                source: format!("{:?}", s.source),
+                rms: s.rms,
+                peak: s.peak,
+            },
+        );
+    });
 
     let stop = vocmeet_capture::StopSignal::new();
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || {
-        vocmeet_capture::record_dual_track(&capture_cfg, &stop_thread)
+        vocmeet_capture::record_dual_track_with_levels(&capture_cfg, &stop_thread, Some(sink))
     });
+
+    // 看门狗：系统轨持续静默就提前告警，不等录完。
+    //
+    // 判断必须由挂钟驱动而不是由电平事件驱动——macOS 上 tap 在完全没有音频流过时
+    // 根本不触发回调，那种情况下一个电平事件都不会来，事件驱动的检测永远不会响。
+    let watchdog_stop = Arc::new(AtomicBool::new(false));
+    let watchdog = if record_system {
+        let flag = watchdog_stop.clone();
+        let seen = last_audio_ms.clone();
+        let wd_app = app.clone();
+        Some(std::thread::spawn(move || {
+            let mut fired = false;
+            while !flag.load(Ordering::Relaxed) {
+                std::thread::sleep(Duration::from_millis(500));
+                if fired || flag.load(Ordering::Relaxed) {
+                    continue;
+                }
+                let elapsed = started.elapsed();
+                let quiet_since = Duration::from_millis(seen.load(Ordering::Relaxed));
+                if elapsed.saturating_sub(quiet_since) >= SILENCE_ALERT_AFTER {
+                    let _ = wd_app.emit(
+                        "recording-warning",
+                        RecordingWarningEvent {
+                            meeting_id,
+                            kind: "system-silent".into(),
+                            // 与录制结束后的告警共用同一份文案。
+                            message: vocmeet_capture::silence_warning(),
+                        },
+                    );
+                    fired = true;
+                }
+            }
+        }))
+    } else {
+        None
+    };
 
     *state.recording.lock().map_err(|_| "录制锁中毒")? = Some(RecordingSession {
         meeting_id,
         stop,
         handle,
+        watchdog_stop,
+        watchdog,
     });
+
+    set_tray_recording(&app, true);
 
     Ok(meeting_id)
 }
@@ -320,13 +408,22 @@ struct StopResult {
 }
 
 #[tauri::command]
-fn stop_recording(state: State<AppState>) -> R<StopResult> {
+fn stop_recording(app: AppHandle, state: State<AppState>) -> R<StopResult> {
     let session = state
         .recording
         .lock()
         .map_err(|_| "录制锁中毒")?
         .take()
         .ok_or("当前没有正在进行的录制")?;
+
+    // 托盘先灭。后面 join 采集线程会阻塞住这个命令，
+    // 拖到那之后再改图标，用户会看到菜单栏还在「录制中」。
+    set_tray_recording(&app, false);
+
+    session.watchdog_stop.store(true, Ordering::Relaxed);
+    if let Some(w) = session.watchdog {
+        let _ = w.join();
+    }
 
     session.stop.stop();
     let rec = session
@@ -1780,6 +1877,85 @@ fn egress_policy_labels() -> Vec<(String, String)> {
     ]
 }
 
+// ---------------------------------------------------------------- 菜单栏托盘
+
+const TRAY_ID: &str = "vocmeet-status";
+const TRAY_IDLE_PNG: &[u8] = include_bytes!("../icons/tray-idle.png");
+const TRAY_RECORDING_PNG: &[u8] = include_bytes!("../icons/tray-recording.png");
+
+/// 菜单栏常驻图标。空闲时是单色 template 图标（自动适配深浅色菜单栏），
+/// 录制时换成砖红实心——窗口不在前台也能一眼看到还在录。
+fn build_tray(app: &AppHandle) -> tauri::Result<()> {
+    use tauri::menu::{Menu, MenuItem};
+    use tauri::tray::TrayIconBuilder;
+
+    let show = MenuItem::with_id(app, "tray-show", "显示主窗口", true, None::<&str>)?;
+    let quit = MenuItem::with_id(app, "tray-quit", "退出 VocMeet", true, None::<&str>)?;
+    let menu = Menu::with_items(app, &[&show, &quit])?;
+
+    TrayIconBuilder::with_id(TRAY_ID)
+        .icon(tauri::image::Image::from_bytes(TRAY_IDLE_PNG)?)
+        .icon_as_template(true)
+        .menu(&menu)
+        // 左键留给「回到窗口」这个高频动作，菜单走右键。
+        .show_menu_on_left_click(false)
+        .on_menu_event(|app, event| match event.id.as_ref() {
+            "tray-show" => focus_main_window(app),
+            "tray-quit" => app.exit(0),
+            _ => {}
+        })
+        .on_tray_icon_event(|tray, event| {
+            use tauri::tray::{MouseButton, MouseButtonState, TrayIconEvent};
+            if let TrayIconEvent::Click {
+                button: MouseButton::Left,
+                button_state: MouseButtonState::Up,
+                ..
+            } = event
+            {
+                focus_main_window(tray.app_handle());
+            }
+        })
+        .build(app)?;
+    Ok(())
+}
+
+fn focus_main_window(app: &AppHandle) {
+    if let Some(w) = app.get_webview_window("main") {
+        let _ = w.show();
+        let _ = w.unminimize();
+        let _ = w.set_focus();
+    }
+}
+
+/// 切换托盘的录制态。失败只记日志——指示器坏了不该影响录制本身。
+///
+/// 录制态那张图是彩色的，必须关掉 template 模式，
+/// 否则 macOS 会把颜色抹掉、只留下轮廓，红色高亮就白做了。
+fn set_tray_recording(app: &AppHandle, recording: bool) {
+    let Some(tray) = app.tray_by_id(TRAY_ID) else {
+        return;
+    };
+    let bytes = if recording {
+        TRAY_RECORDING_PNG
+    } else {
+        TRAY_IDLE_PNG
+    };
+    match tauri::image::Image::from_bytes(bytes) {
+        Ok(img) => {
+            let _ = tray.set_icon_as_template(!recording);
+            if let Err(e) = tray.set_icon(Some(img)) {
+                tracing::warn!("切换托盘图标失败: {e}");
+            }
+            let _ = tray.set_tooltip(Some(if recording {
+                "VocMeet 正在录制"
+            } else {
+                "VocMeet"
+            }));
+        }
+        Err(e) => tracing::warn!("托盘图标解码失败: {e}"),
+    }
+}
+
 // ---------------------------------------------------------------- 入口
 
 fn now_iso() -> String {
@@ -1866,6 +2042,10 @@ fn main() {
             // 不用通配符——webview 能读什么文件是安全边界的一部分。
             if let Err(e) = app.asset_protocol_scope().allow_directory(&audio_dir, true) {
                 tracing::warn!("无法为音频目录开放 asset 协议: {e}");
+            }
+            if let Err(e) = build_tray(app.handle()) {
+                // 托盘只是状态指示，建不起来不该拦住应用启动。
+                tracing::warn!("菜单栏图标初始化失败: {e}");
             }
             Ok(())
         })

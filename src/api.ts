@@ -9,12 +9,14 @@ import type {
   DeviceInfo,
   DoctorReport,
   DoneEvent,
+  LevelEvent,
   LlmDiagnosis,
   Meeting,
   ModelFetchEvent,
   ModelPlan,
   ProgressEvent,
   PullEvent,
+  RecordingWarningEvent,
   SuggestedModel,
   SpeakerRow,
   StopResult,
@@ -138,6 +140,10 @@ export const events = {
     listen<PullEvent>("llm-pull-progress", (e) => cb(e.payload)),
   onPullDone: (cb: (e: DoneEvent) => void): Promise<UnlistenFn> =>
     listen<DoneEvent>("llm-pull-done", (e) => cb(e.payload)),
+  onRecordingLevel: (cb: (e: LevelEvent) => void): Promise<UnlistenFn> =>
+    listen<LevelEvent>("recording-level", (e) => cb(e.payload)),
+  onRecordingWarning: (cb: (e: RecordingWarningEvent) => void): Promise<UnlistenFn> =>
+    listen<RecordingWarningEvent>("recording-warning", (e) => cb(e.payload)),
 };
 
 /** Tauri command 的错误是字符串，统一成消息文本方便 UI 处理。 */

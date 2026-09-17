@@ -193,6 +193,25 @@ export interface PullEvent {
 /** 一个可选模型：[名字, 说明, 上下文长度]。 */
 export type SuggestedModel = [string, string, number];
 
+/** 录制中的哪一条轨。与 Rust 侧 `Source` 的 Debug 名对齐。 */
+export type TrackSource = "Mic" | "System";
+
+/** 录制中的实时电平，每轨约 20 Hz 一条。 */
+export interface LevelEvent {
+  source: TrackSource;
+  /** 均方根，驱动波形高度。0..1 */
+  rms: number;
+  /** 本窗口峰值，留给削波提示。0..1 */
+  peak: number;
+}
+
+/** 录制过程中的告警。目前只有系统轨静音一种。 */
+export interface RecordingWarningEvent {
+  meeting_id: number;
+  kind: string;
+  message: string;
+}
+
 /** 字节数变成人看的单位。下载进度里到处要用。 */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;
