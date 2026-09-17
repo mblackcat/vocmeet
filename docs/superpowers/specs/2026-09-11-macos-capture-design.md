@@ -158,9 +158,19 @@ macOS 上是可用的，把整个应用锁死在 14.6 以上是净损失。老�
 2. **未签名应用能否拿到系统录音权限**——TCC 弹窗可能根本不出现，需要用户手动在
    系统设置里添加 VocMeet。
 3. **`tauri dev` 与打包后的 `.app` 是不同二进制**，权限授予可能不互通。
-4. **是否存在对应的 Info.plist key 来声明系统音频采集意图**——可能纯靠系统设置开关，
-   无 plist key。
+4. ~~**是否存在对应的 Info.plist key 来声明系统音频采集意图**~~——**已核实：存在，且是必需的。**
+   key 是 `NSAudioCaptureUsageDescription`。不声明它，应用**根本不会出现在**
+   「系统设置 → 隐私与安全性 → 屏幕与系统音频录制」的列表里，用户想授权也没得勾，
+   而 tap 仍会创建成功并静默录出空音频——正是本文档开头那个坑的完整成因。
+   本机取证：Granola / ChatGPT / Lark / VS Code 四个应用都声明了这个 key，
+   其中 Granola（同类会议转写应用）出现在该页的 **"System Audio Recording Only"** 分区。
+   已于 `src-tauri/Info.plist` 补上。
 5. cpal 的 loopback 能力较新（2025-12 落地，2026-06 修缺陷），长时间录制稳定性未知。
+6. **ad-hoc 签名与 TCC/Keychain 的稳定性**——实测每次重新构建后，`.app` 的 ad-hoc
+   签名（cdhash）都会变，macOS 因此当成另一个应用：Keychain 会重新弹「VocMeet wants to
+   use your confidential information」要求输入登录密码，TCC 授权同理需要重新授予。
+   这不只是开发期的麻烦，**用户每次升级版本都会撞上**。根治要 Developer ID 证书
+   （TCC 按 team id + bundle id 认应用，跨版本稳定）。
 
 ## 明确不做（YAGNI）
 

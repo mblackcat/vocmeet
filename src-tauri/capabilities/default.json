@@ -1,11 +1,12 @@
 {
   "$schema": "../gen/schemas/desktop-schema.json",
   "identifier": "default",
-  "description": "主窗口所需的最小权限：事件订阅（进度回推与文件拖放）与文件选择框。",
+  "description": "主窗口所需的最小权限：事件订阅（进度回推与文件拖放）、文件选择框，以及自绘标题栏后拖动窗口。",
   "windows": ["main"],
   "permissions": [
     "core:default",
     "dialog:allow-open",
-    "dialog:allow-save"
+    "dialog:allow-save",
+    "core:window:allow-start-dragging"
   ]
 }
