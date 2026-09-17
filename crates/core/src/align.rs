@@ -82,27 +82,30 @@ pub fn assign_speakers(asr: Vec<AsrSegment>, diar: &[DiarSegment]) -> Vec<Uttera
     out
 }
 
-/// 返回 (最佳说话人, 重叠占比, 横跨的说话人数)。
+/// 返回 (最佳说话人, 重叠占比, 横跨的**说话人**数)。
+///
+/// 数的是不同说话人，不是 diarization 段数——同一个人连续说话时
+/// diarization 会切出好几段（窗步进 0.1 时尤其碎），那不代表归属不可靠。
+/// 早期实现数的是段数，实测一场真实会议里 45% 的发言被误标成低置信。
 fn best_speaker(seg: &AsrSegment, diar: &[DiarSegment]) -> (Option<i32>, f32, usize) {
     let seg_len = seg.end_ms.saturating_sub(seg.start_ms).max(1) as f32;
 
-    let mut best: Option<(i32, u32)> = None;
-    let mut spanned = 0usize;
-
+    // 同一说话人的多段重叠要累加，否则「被切碎的那个人」会输给「只有一整段的人」。
+    let mut per_speaker: Vec<(i32, u32)> = Vec::new();
     for d in diar {
         let ov = overlap_ms(seg.start_ms, seg.end_ms, d.start_ms, d.end_ms);
         if ov == 0 {
             continue;
         }
-        spanned += 1;
-        match best {
-            Some((_, best_ov)) if best_ov >= ov => {}
-            _ => best = Some((d.speaker, ov)),
+        match per_speaker.iter_mut().find(|(s, _)| *s == d.speaker) {
+            Some((_, total)) => *total += ov,
+            None => per_speaker.push((d.speaker, ov)),
         }
     }
 
-    match best {
-        Some((spk, ov)) => (Some(spk), ov as f32 / seg_len, spanned),
+    let spanned = per_speaker.len();
+    match per_speaker.iter().max_by_key(|(_, ov)| *ov) {
+        Some(&(spk, ov)) => (Some(spk), ov as f32 / seg_len, spanned),
         None => (None, 0.0, 0),
     }
 }
@@ -224,6 +227,40 @@ mod tests {
         let out = assign_speakers(vec![asr(100, 900, "确定", Source::System)], &d);
         assert_eq!(out[0].speaker_id, "spk_3");
         assert!(!out[0].low_confidence);
+    }
+
+    #[test]
+    fn one_speaker_split_into_many_diar_segments_is_still_confident() {
+        // 真实世界的常态：同一个人连续说话，diarization 按窗切成好几段
+        // （window_shift_ratio 0.1 时尤其碎）。这不该被当成「横跨多个说话人」。
+        // 实测一场真实会议里，按段数判会让 45% 的发言被误标低置信。
+        let d = vec![
+            diar(0, 500, 7),
+            diar(500, 1000, 7),
+            diar(1000, 1500, 7),
+            diar(1500, 2000, 7),
+        ];
+        let out = assign_speakers(vec![asr(100, 1900, "一个人一口气说完", Source::System)], &d);
+        assert_eq!(out[0].speaker_id, "spk_7");
+        assert!(
+            !out[0].low_confidence,
+            "同一个人被切成多段不等于归属不可靠"
+        );
+    }
+
+    #[test]
+    fn overlap_ratio_sums_across_the_same_speakers_segments() {
+        // 被切碎的那个人不该输给「只有一整段」的另一个人：
+        // spk_1 三段合计 900ms > spk_2 的一段 600ms。
+        let d = vec![
+            diar(0, 300, 1),
+            diar(300, 600, 1),
+            diar(600, 900, 1),
+            diar(900, 1500, 2),
+        ];
+        let out = assign_speakers(vec![asr(0, 1500, "谁说的", Source::System)], &d);
+        assert_eq!(out[0].speaker_id, "spk_1", "同一说话人的多段重叠要累加");
+        assert!(out[0].low_confidence, "确实横跨了两个说话人，仍该标低置信");
     }
 
     #[test]
