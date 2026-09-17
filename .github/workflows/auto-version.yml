@@ -36,6 +36,9 @@ jobs:
         with:
           node-version: 22
 
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
       - name: 计算下一个版本号
         id: bump
         env:
@@ -75,9 +78,15 @@ jobs:
           set -euo pipefail
           v="${{ steps.bump.outputs.new_version }}"
           npm pkg set version="$v"
+          # npm pkg set 只改 package.json，package-lock.json 里的 version 字段不会跟着动，
+          # 之前一直停在 0.1.0。--package-lock-only 不装依赖，只把 lock 重写一遍。
+          npm install --package-lock-only
           sed -i "0,/^version = \".*\"/s//version = \"$v\"/" Cargo.toml
           sed -i "0,/^version = \".*\"/s//version = \"$v\"/" src-tauri/Cargo.toml
           sed -i "s/\"version\": \".*\"/\"version\": \"$v\"/" src-tauri/tauri.conf.json
+          # 同理，Cargo.toml 改完后 Cargo.lock 里各 workspace crate 的版本号还是旧的。
+          # -w 只刷新 workspace 成员条目，不会顺带升级第三方依赖。
+          cargo update --workspace
 
       - name: 提交并打 tag
         run: |
@@ -85,7 +94,7 @@ jobs:
           v="${{ steps.bump.outputs.new_version }}"
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add package.json Cargo.toml src-tauri/Cargo.toml src-tauri/tauri.conf.json
+          git add package.json package-lock.json Cargo.toml Cargo.lock src-tauri/Cargo.toml src-tauri/tauri.conf.json
           git commit -m "chore: bump version to v$v [skip ci]"
           git tag "v$v"
           git push origin HEAD:main

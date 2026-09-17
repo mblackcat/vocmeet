@@ -68,7 +68,9 @@ jobs:
               或在终端执行 `xattr -dr com.apple.quarantine /Applications/VocMeet.app` 一次性放行。
             - 首次安装运行后，请前往「设置」页点击「一键下载模型」以初始化离线语音识别与说话人分离权重。
             - 纪要生成推荐配合本地 Ollama (`ollama serve && ollama pull qwen2.5:7b`)。
-            - macOS 版本暂未支持系统音频采集（见 README「已知限制」），可通过拖拽已有录音文件使用转写与纪要功能。
+            - macOS 系统音频采集走 CoreAudio process tap，**需要 macOS 14.6 或更高版本**。
+              首次录制前请到「系统设置 → 隐私与安全性」里同时开启**麦克风**和**系统录音**两项权限，
+              否则系统轨会静默录成空音频（详见 README「桌面应用」）。
 
             ### 合规提示
             请遵守当地录音法律规范，开启录制前确保已取得全体参会人知情同意。详情参见项目 `DISCLAIMER.md`。
