@@ -84,6 +84,51 @@ pub trait TranscriptionEngine: Send + Sync {
         progress: &dyn Fn(Progress),
         cancel: &CancelToken,
     ) -> Result<Vec<Utterance>>;
+
+    /// 只做 VAD + ASR，不做 diarization 与标点。会中逐段调用。
+    ///
+    /// `offset_ms` 是本段起点在整轨中的位置，用来把段内时间戳换算到整轨坐标——
+    /// 否则会后 diarization 的时间轴对不上。
+    ///
+    /// `hold_tail` 为真时，贴着段尾的那段语音**不转写**，而是作为 `carry` 交还调用方，
+    /// 由调用方拼到下一段前面。分段边界会把词切成两半（实测「说话人分离」
+    /// 被切成「说话」+「盐分离」），不这样兜住就会把错字写进逐字稿。
+    /// 录制结束、没有下一段时传 false，把尾巴转完。
+    fn transcribe_segment(
+        &self,
+        pcm: &Pcm,
+        source: Source,
+        offset_ms: u32,
+        hold_tail: bool,
+        cancel: &CancelToken,
+    ) -> Result<SegmentOutcome>;
+}
+
+/// 一段会中转写的产出。
+#[derive(Debug, Default)]
+pub struct SegmentOutcome {
+    pub segments: Vec<align::AsrSegment>,
+    /// 贴着段尾、可能被截断的音频。调用方必须原样拼到下一段前面。
+    pub carry: Option<Pcm>,
+    /// `carry` 在整轨中的起点，拼接后作为下一次的 `offset_ms`。
+    pub carry_start_ms: u32,
+}
+
+/// 语音段结尾距离本段末尾多近就算「可能被截断」。
+const TAIL_GUARD_MS: u32 = 200;
+
+/// 跨段缓冲的上限。有人一口气说好几分钟时不能无限往后拖，
+/// 到顶就照常转写——边界错一个字，好过实时稿彻底不出来。
+const MAX_CARRY_MS: u32 = 10_000;
+
+/// 这段语音是否贴着段尾、需要留到下一段再转。
+///
+/// 实测依据：8 秒一段切分时，「说话人分离」正好跨在边界上，
+/// 被转成「说话」+「盐分离」——两边都错。留到下一段拼起来再转才不会错。
+fn should_hold_tail(last_start_ms: u32, last_end_ms: u32, total_ms: u32) -> bool {
+    let touches_end = last_end_ms + TAIL_GUARD_MS >= total_ms;
+    let within_budget = total_ms.saturating_sub(last_start_ms) <= MAX_CARRY_MS;
+    touches_end && within_budget
 }
 
 /// 引擎可调参数。默认值来自 sherpa-onnx 官方示例，W1 调参后落到配置文件。
@@ -100,6 +145,11 @@ pub struct EngineOptions {
     pub cluster_threshold: f32,
     /// 相邻同说话人段落合并的最大间隔（毫秒）。§4.2：仅 <2s 才合并。
     pub merge_gap_ms: u32,
+    /// 说话人分离的分割窗步进比例。越小越细、越慢。
+    ///
+    /// sherpa 官方示例用 0.1（即 10 倍重叠），精度最好但代价很大——
+    /// 它是整条链路的瓶颈。调大直接按比例省时间，代价是说话人切换点的定位变粗。
+    pub diar_window_shift_ratio: f32,
     pub debug: bool,
 }
 
@@ -114,6 +164,7 @@ impl Default for EngineOptions {
             min_speech_duration: 0.25,
             cluster_threshold: 0.5,
             merge_gap_ms: 2_000,
+            diar_window_shift_ratio: 0.1,
             debug: false,
         }
     }
@@ -270,17 +321,26 @@ impl SherpaEngine {
     }
 
     /// 系统轨的说话人分离。
+    ///
+    /// 这是整条链路最慢的一段（实测 188s 音频：整轨 111s 里它和标点占掉 94s，
+    /// 而 VAD + ASR 只要 14.7s）。所以这里的两个参数值得较真。
     fn diarize(&self, pcm: &Pcm, known_speakers: Option<i32>) -> Result<Vec<DiarSegment>> {
         let config = OfflineSpeakerDiarizationConfig {
             segmentation: OfflineSpeakerSegmentationModelConfig {
                 pyannote: OfflineSpeakerSegmentationPyannoteModelConfig {
                     model: Some(self.segmentation_model.clone()),
-                    window_shift_ratio: 0.1,
+                    window_shift_ratio: self.opts.diar_window_shift_ratio,
                 },
+                // 不显式传的话 sherpa 默认 num_threads = 1——
+                // 于是最慢的一段反而是单线程跑的，识别那段却用着配置里的线程数。
+                num_threads: self.opts.num_threads,
+                provider: Some(self.opts.provider.clone()),
                 ..Default::default()
             },
             embedding: SpeakerEmbeddingExtractorConfig {
                 model: Some(self.embedding_model.clone()),
+                num_threads: self.opts.num_threads,
+                provider: Some(self.opts.provider.clone()),
                 ..Default::default()
             },
             clustering: FastClusteringConfig {
@@ -408,6 +468,60 @@ impl TranscriptionEngine for SherpaEngine {
 
         Ok(utterances)
     }
+
+    fn transcribe_segment(
+        &self,
+        pcm: &Pcm,
+        source: Source,
+        offset_ms: u32,
+        hold_tail: bool,
+        cancel: &CancelToken,
+    ) -> Result<SegmentOutcome> {
+        require_target_rate(pcm)?;
+
+        let mut speech = self.split_speech(pcm, cancel)?;
+        let total_ms = samples_to_ms(pcm.samples.len());
+
+        // 贴着段尾的那段很可能被切断了，留给下一段拼上再转。
+        let mut carry = None;
+        let mut carry_start_ms = 0;
+        if hold_tail {
+            if let Some(last) = speech.last() {
+                if should_hold_tail(last.start_ms, last.end_ms, total_ms) {
+                    let from = (last.start_ms as usize) * (TARGET_SAMPLE_RATE as usize) / 1000;
+                    let from = from.min(pcm.samples.len());
+                    carry_start_ms = offset_ms + last.start_ms;
+                    carry = Some(Pcm {
+                        sample_rate: TARGET_SAMPLE_RATE,
+                        // 连尾部静音一起带走，下一轮 VAD 才看到连续的音频
+                        samples: pcm.samples[from..].to_vec(),
+                    });
+                    speech.pop();
+                }
+            }
+        }
+
+        // 进度在这条路径上没有意义——调用方按段驱动，自己知道进展。
+        let noop = |_: Progress| {};
+        let mut segments = self.recognize_segments(&speech, source, &noop, cancel)?;
+
+        // 段内坐标换算到整轨坐标。不换的话每段都从 0 开始，
+        // 会后 diarization 按整轨时间轴对齐时会全部错位。
+        for s in &mut segments {
+            s.start_ms += offset_ms;
+            s.end_ms += offset_ms;
+            if let Some(ts) = &mut s.word_times_ms {
+                for t in ts.iter_mut() {
+                    *t += offset_ms;
+                }
+            }
+        }
+        Ok(SegmentOutcome {
+            segments,
+            carry,
+            carry_start_ms,
+        })
+    }
 }
 
 fn samples_to_ms(samples: usize) -> u32 {
@@ -458,5 +572,51 @@ mod tests {
             samples: vec![0.0; 10],
         };
         assert!(require_target_rate(&pcm).is_err());
+    }
+
+    #[test]
+    fn segment_timestamps_shift_to_whole_track_coordinates() {
+        // transcribe_segment 的偏移换算。段内 0..900ms 的一段，
+        // 若本段从整轨 30s 处开始，就该落在 30000..30900。
+        let offset_ms = 30_000u32;
+        let mut s = align::AsrSegment {
+            start_ms: 0,
+            end_ms: 900,
+            text: "第三段的第一句".into(),
+            word_times_ms: Some(vec![0, 300, 600]),
+            source: Source::System,
+        };
+
+        s.start_ms += offset_ms;
+        s.end_ms += offset_ms;
+        if let Some(ts) = &mut s.word_times_ms {
+            for t in ts.iter_mut() {
+                *t += offset_ms;
+            }
+        }
+
+        assert_eq!((s.start_ms, s.end_ms), (30_000, 30_900));
+        assert_eq!(s.word_times_ms.unwrap(), vec![30_000, 30_300, 30_600]);
+    }
+
+    #[test]
+    fn tail_touching_the_segment_end_is_held_back() {
+        // 15 秒一段，最后一句说到 14.9s——几乎肯定被切断了，要留给下一段
+        assert!(should_hold_tail(13_000, 14_900, 15_000));
+        // 正好卡在门限上
+        assert!(should_hold_tail(13_000, 15_000 - TAIL_GUARD_MS, 15_000));
+    }
+
+    #[test]
+    fn tail_well_inside_the_segment_is_transcribed_now() {
+        // 最后一句 10s 就说完了，离段尾还有 5 秒静音——没被切断，当场转
+        assert!(!should_hold_tail(8_000, 10_000, 15_000));
+    }
+
+    #[test]
+    fn overlong_tail_is_not_held_forever() {
+        // 有人一口气说了 20 秒还没停：再往后拖会让实时稿一直不出字，
+        // 到了上限就照常转写，宁可边界错一个字。
+        assert!(!should_hold_tail(0, 20_000, 20_000));
     }
 }

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { open } from "@tauri-apps/plugin-dialog";
 import { api, asMessage, events } from "../api";
-import type { ProcessEvent, TrackSource } from "../types";
+import type { LiveLine, ProcessEvent, TrackSource } from "../types";
 
 interface Props {
   liveId: number | null;
@@ -26,6 +26,12 @@ const BARS = 13;
 
 /** 电平表保留多少格历史。20Hz 下 48 格约 2.4 秒，读起来是一段音轨而不是跳动的柱子。 */
 const METER_SLOTS = 48;
+
+/** 实时逐字稿在 DOM 里最多留多少行。一场两小时的会否则能堆出上千个节点。 */
+const LIVE_KEEP = 300;
+
+/** 会中只能按轨区分说话人——diarization 要整轨聚类，这时候还跑不了。 */
+const LIVE_SPEAKER: Record<TrackSource, string> = { Mic: "我", System: "对方" };
 
 /** 两条轨的显示顺序与标签。 */
 const TRACKS: Array<{ key: TrackSource; label: string }> = [
@@ -107,7 +113,12 @@ export default function Session({
   const [asr, setAsr] = useState<number | null>(null);
   /** 录制中的告警（目前只有系统轨静音）。后端判定，前端只负责显示。 */
   const [warning, setWarning] = useState<string | null>(null);
+  /** 会中实时逐字稿。只保留最近 LIVE_KEEP 行，长会议不至于把 DOM 撑爆。 */
+  const [live, setLive] = useState<LiveLine[]>([]);
+  /** 实时转写不可用时的说明（引擎没起来等）。 */
+  const [liveOff, setLiveOff] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
+  const liveBottom = useRef<HTMLDivElement>(null);
 
   /** 每轨的电平历史，最新的在末尾。存 ref 不存 state。 */
   const history = useRef<Record<TrackSource, number[]>>({ Mic: [], System: [] });
@@ -138,8 +149,25 @@ export default function Session({
       })
       .then((f) => off.push(f));
     void events.onRecordingWarning((e) => setWarning(e.message)).then((f) => off.push(f));
+    void events
+      .onLiveTranscript((e) => {
+        setLive((prev) => {
+          const next = prev.concat(e.lines);
+          // 会中的段按时间顺序到达，但麦克风轨和系统轨是两个线程各自推的，
+          // 到达顺序不等于时间顺序，得按 start_ms 排一下才读得通。
+          next.sort((a, b) => a.start_ms - b.start_ms);
+          return next.length > LIVE_KEEP ? next.slice(next.length - LIVE_KEEP) : next;
+        });
+      })
+      .then((f) => off.push(f));
+    void events.onLiveTranscriptOff((e) => setLiveOff(e.message)).then((f) => off.push(f));
     return () => off.forEach((f) => f());
   }, []);
+
+  // 新的一行出来就滚到底，跟读会议节奏。
+  useEffect(() => {
+    liveBottom.current?.scrollIntoView({ behavior: "smooth", block: "end" });
+  }, [live.length]);
 
   // 录制期间把电平历史刷到 DOM。挂 rAF 而不是 setState：
   // 20Hz × 2 轨 = 每秒 40 次重渲染，够把主线程拖出掉帧。
@@ -147,6 +175,8 @@ export default function Session({
     if (!recording) {
       history.current = { Mic: [], System: [] };
       setWarning(null);
+      setLive([]);
+      setLiveOff(null);
       return;
     }
     let raf = 0;
@@ -289,30 +319,54 @@ export default function Session({
 
   return (
     <div className="live-layout">
-      <div className="center">
+      <div className={recording ? "center recording" : "center"}>
         {recording ? (
           <>
-            <div className="title-input" style={{ pointerEvents: "none" }}>
-              {liveTitle || "未命名会议"}
+            <div className="live-head">
+              <span className="live-name">{liveTitle || "未命名会议"}</span>
             </div>
-            <div className="meter">
-              {TRACKS.map((t) => (
-                <TrackMeter
-                  key={t.key}
-                  label={t.label}
-                  silent={t.key === "System" && warning !== null}
-                  barsRef={(el) => {
-                    barsEl.current[t.key] = el;
-                  }}
-                />
-              ))}
+
+            {/* 会中逐字稿占主区——开会时它才是要看的东西 */}
+            <div className="live-script">
+              {live.length === 0 ? (
+                <p className="live-idle">
+                  {liveOff ?? "开始说话后，这里会逐段出现会议记录…"}
+                </p>
+              ) : (
+                live.map((l, i) => (
+                  <div className="live-line" key={`${l.start_ms}-${i}`}>
+                    <span className={l.source === "Mic" ? "who me" : "who"}>
+                      {LIVE_SPEAKER[l.source]}
+                    </span>
+                    <span className="said">{l.text}</span>
+                  </div>
+                ))
+              )}
+              <div ref={liveBottom} />
             </div>
+
             {warning && <p className="meter-warn">{warning}</p>}
-            <div className="elapsed">{clock}</div>
-            <button className="record stop" onClick={() => void end()}>
-              <span className="disc"><i /></span>
-              <span className="cap">结束会议</span>
-            </button>
+
+            {/* 电平表压成细条，但不能去掉——它是「有没有收音」的答案 */}
+            <div className="live-foot">
+              <div className="meter compact">
+                {TRACKS.map((t) => (
+                  <TrackMeter
+                    key={t.key}
+                    label={t.label}
+                    silent={t.key === "System" && warning !== null}
+                    barsRef={(el) => {
+                      barsEl.current[t.key] = el;
+                    }}
+                  />
+                ))}
+              </div>
+              <div className="elapsed">{clock}</div>
+              <button className="record stop" onClick={() => void end()}>
+                <span className="disc"><i /></span>
+                <span className="cap">结束会议</span>
+              </button>
+            </div>
           </>
         ) : (
           <>

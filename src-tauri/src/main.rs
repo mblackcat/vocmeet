@@ -39,6 +39,10 @@ struct RecordingSession {
     /// 而「一个回调都没来」正是它要抓的情况，不能由数据驱动。
     watchdog_stop: Arc<AtomicBool>,
     watchdog: Option<std::thread::JoinHandle<()>>,
+    /// 会中实时转写线程。只服务于「会中看得见」——
+    /// 会后一律整轨重算，所以这里不保留它的产出。
+    live: Option<std::thread::JoinHandle<()>>,
+    live_dropped: Arc<AtomicU64>,
 }
 
 struct AppState {
@@ -297,6 +301,28 @@ struct RecordingWarningEvent {
 /// 系统轨静默多久就告警。够长以躲开会议开场的安静，又远短于一场会。
 const SILENCE_ALERT_AFTER: Duration = Duration::from_secs(10);
 
+/// 实时转写待处理队列的上限（段数）。
+///
+/// 超了就丢最旧的段。15 秒一段、上限 4 段 = 允许转写落后约一分钟；
+/// 再落后说明这台机器跟不上，继续排队只会越积越多且吃内存，
+/// 不如丢掉交给会后那次完整转写——那条路径本来就兜得住。
+const LIVE_QUEUE_LIMIT: u64 = 4;
+
+/// 实时逐字稿的一行。
+#[derive(Serialize, Clone)]
+struct LiveLine {
+    start_ms: u32,
+    /// "Mic" 或 "System"。会中拿不到真实说话人身份，前端据此显示「我 / 对方」。
+    source: String,
+    text: String,
+}
+
+#[derive(Serialize, Clone)]
+struct LiveTranscriptEvent {
+    meeting_id: i64,
+    lines: Vec<LiveLine>,
+}
+
 #[tauri::command]
 fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i64> {
     {
@@ -320,6 +346,7 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
         min_free_bytes: cfg.capture.min_free_bytes,
         record_mic: cfg.capture.record_mic,
         record_system,
+        live_segment_seconds: cfg.capture.live_segment_seconds,
     };
 
     // 系统轨最后一次听到声音的时刻，以录制开始为 0 点，单位毫秒。
@@ -344,9 +371,157 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
     });
 
     let stop = vocmeet_capture::StopSignal::new();
+
+    // ---- 会中实时转写 ----
+    //
+    // 采集是实时任务，绝不能被转写堵住。所以走有界队列：
+    // 满了就丢最旧的段并计数，丢掉的部分由会后那次转写兜住（pre_asr 为空即全量重算）。
+    let live_on = cfg.capture.live_transcribe;
+    let live_dropped = Arc::new(AtomicU64::new(0));
+    let (seg_tx, seg_rx) = std::sync::mpsc::channel::<vocmeet_capture::LiveSegment>();
+    let queued = Arc::new(AtomicU64::new(0));
+
+    let segment_sink: Option<vocmeet_capture::SegmentSink> = if live_on {
+        let q = queued.clone();
+        let dropped = live_dropped.clone();
+        Some(Arc::new(move |seg: vocmeet_capture::LiveSegment| {
+            // 队列深度自己数：转写跟不上就直接丢，不阻塞采集线程。
+            if q.load(Ordering::Relaxed) >= LIVE_QUEUE_LIMIT {
+                dropped.fetch_add(1, Ordering::Relaxed);
+                return;
+            }
+            q.fetch_add(1, Ordering::Relaxed);
+            let _ = seg_tx.send(seg);
+        }))
+    } else {
+        None
+    };
+
+    let live_handle = if live_on {
+        let app_live = app.clone();
+        let q = queued.clone();
+        let models_dir = cfg.models_dir.clone();
+        let engine_opts = cfg.engine.to_options();
+        Some(std::thread::spawn(move || {
+            // 引擎加载一次整场复用（实测 0.7s）。加载失败不该让录制挂掉——
+            // 实时稿只是加分项，录音本身与会后转写都不依赖它。
+            let engine = match SherpaEngine::new(&ModelSet::from_root(&models_dir), engine_opts) {
+                Ok(e) => e,
+                Err(e) => {
+                    tracing::warn!("实时转写引擎加载失败，本场退回会后整轨转写：{e}");
+                    let _ = app_live.emit(
+                        "live-transcript-off",
+                        RecordingWarningEvent {
+                            meeting_id,
+                            kind: "live-engine-failed".into(),
+                            message: format!("实时转写不可用（{e}），会后仍会完整转写。"),
+                        },
+                    );
+                    // 把队列排空，免得 sink 那边一直累积计数。
+                    while seg_rx.recv().is_ok() {
+                        q.fetch_sub(1, Ordering::Relaxed);
+                    }
+                    return;
+                }
+            };
+            let cancel = CancelToken::new();
+
+            // 每轨各自的跨段缓冲：贴着段尾、可能被切断的那截音频，
+            // 拼到下一段前面再转。两轨是两个独立的时间轴，不能共用。
+            let mut carry: std::collections::HashMap<String, (audio::Pcm, u32)> =
+                std::collections::HashMap::new();
+
+            // 采集线程收尾后 channel 断开，这里自然退出。
+            // 退出前还要把两轨各自剩下的尾巴转掉，否则最后一句永远不出现。
+            let drain_tail = |engine: &SherpaEngine,
+                              carry: &mut std::collections::HashMap<String, (audio::Pcm, u32)>,
+                              app: &AppHandle| {
+                for (key, (pcm, start)) in carry.drain() {
+                    let source = if key == "Mic" {
+                        vocmeet_core::Source::Mic
+                    } else {
+                        vocmeet_core::Source::System
+                    };
+                    // hold_tail = false：没有下一段了，全部转完
+                    if let Ok(out) = engine.transcribe_segment(&pcm, source, start, false, &cancel) {
+                        if out.segments.is_empty() {
+                            continue;
+                        }
+                        let lines: Vec<LiveLine> = out
+                            .segments
+                            .iter()
+                            .map(|s| LiveLine {
+                                start_ms: s.start_ms,
+                                source: key.clone(),
+                                text: s.text.clone(),
+                            })
+                            .collect();
+                        let _ = app.emit("live-transcript", LiveTranscriptEvent { meeting_id, lines });
+                    }
+                }
+            };
+
+            while let Ok(seg) = seg_rx.recv() {
+                q.fetch_sub(1, Ordering::Relaxed);
+                let source = seg.source;
+                let key = format!("{source:?}");
+
+                // 把上一轮留下的尾巴拼到本段前面，时间原点随之前移。
+                let (input, offset) = match carry.remove(&key) {
+                    Some((prev, prev_start)) => {
+                        let mut samples = prev.samples;
+                        samples.extend_from_slice(&seg.pcm.samples);
+                        (
+                            audio::Pcm {
+                                sample_rate: seg.pcm.sample_rate,
+                                samples,
+                            },
+                            prev_start,
+                        )
+                    }
+                    None => (seg.pcm, seg.start_ms),
+                };
+
+                match engine.transcribe_segment(&input, source, offset, true, &cancel) {
+                    Ok(out) => {
+                        if let Some(c) = out.carry {
+                            carry.insert(key.clone(), (c, out.carry_start_ms));
+                        }
+                        if out.segments.is_empty() {
+                            continue;
+                        }
+                        let lines: Vec<LiveLine> = out
+                            .segments
+                            .iter()
+                            .map(|s| LiveLine {
+                                start_ms: s.start_ms,
+                                source: key.clone(),
+                                text: s.text.clone(),
+                            })
+                            .collect();
+                        let _ = app_live.emit(
+                            "live-transcript",
+                            LiveTranscriptEvent { meeting_id, lines },
+                        );
+                    }
+                    Err(e) => tracing::warn!("实时转写一段失败（会后会补上）：{e}"),
+                }
+            }
+
+            drain_tail(&engine, &mut carry, &app_live);
+        }))
+    } else {
+        None
+    };
+
     let stop_thread = stop.clone();
     let handle = std::thread::spawn(move || {
-        vocmeet_capture::record_dual_track_with_levels(&capture_cfg, &stop_thread, Some(sink))
+        vocmeet_capture::record_dual_track_with_levels(
+            &capture_cfg,
+            &stop_thread,
+            Some(sink),
+            segment_sink,
+        )
     });
 
     // 看门狗：系统轨持续静默就提前告警，不等录完。
@@ -391,6 +566,8 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
         handle,
         watchdog_stop,
         watchdog,
+        live: live_handle,
+        live_dropped,
     });
 
     set_tray_recording(&app, true);
@@ -432,6 +609,14 @@ fn stop_recording(app: AppHandle, state: State<AppState>) -> R<StopResult> {
         .map_err(|_| "录制线程 panic".to_string())?
         .map_err(err)?;
 
+    // 采集线程已经收尾（含 tap.flush 发出的最后一段），sink 随之释放，
+    // channel 断开，实时转写线程自然退出。在这里 join 才能拿到**完整**的段集合——
+    // 提前取的话最后十几秒会漏掉。
+    if let Some(h) = session.live {
+        let _ = h.join();
+    }
+    let dropped = session.live_dropped.load(Ordering::Relaxed);
+
     let duration_ms = rec
         .mic_chunks
         .iter()
@@ -455,11 +640,21 @@ fn stop_recording(app: AppHandle, state: State<AppState>) -> R<StopResult> {
         let _ = store.set_playback_path(session.meeting_id, path);
     }
 
+    // 实时稿只服务于「会中看得见」，会后一律整轨重算，不复用会中结果。
+    //
+    // 这是实测后的决定：188s 音频上整轨 111s，其中 VAD+ASR 只占 14.7s，
+    // 说话人分离与标点占掉 94s。复用最多省 15%，却要承担分段边界识别变差的风险
+    // （实测「说话人分离」被切成两段后认成「多话人分离」）。不划算。
+    let mut warnings = rec.warnings.clone();
+    if dropped > 0 {
+        tracing::info!("实时转写有 {dropped} 段没跟上被丢弃（只影响会中显示）");
+    }
+
     let result = StopResult {
         meeting_id: session.meeting_id,
         mic_chunks: rec.mic_chunks.len(),
         system_chunks: rec.system_chunks.len(),
-        warnings: rec.warnings.clone(),
+        warnings: std::mem::take(&mut warnings),
         duration_ms,
     };
 

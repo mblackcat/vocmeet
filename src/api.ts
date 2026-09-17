@@ -10,6 +10,7 @@ import type {
   DoctorReport,
   DoneEvent,
   LevelEvent,
+  LiveTranscriptEvent,
   LlmDiagnosis,
   Meeting,
   ModelFetchEvent,
@@ -144,6 +145,11 @@ export const events = {
     listen<LevelEvent>("recording-level", (e) => cb(e.payload)),
   onRecordingWarning: (cb: (e: RecordingWarningEvent) => void): Promise<UnlistenFn> =>
     listen<RecordingWarningEvent>("recording-warning", (e) => cb(e.payload)),
+  onLiveTranscript: (cb: (e: LiveTranscriptEvent) => void): Promise<UnlistenFn> =>
+    listen<LiveTranscriptEvent>("live-transcript", (e) => cb(e.payload)),
+  /** 实时转写引擎没起来——会后仍会完整转写，只是会中没有稿。 */
+  onLiveTranscriptOff: (cb: (e: RecordingWarningEvent) => void): Promise<UnlistenFn> =>
+    listen<RecordingWarningEvent>("live-transcript-off", (e) => cb(e.payload)),
 };
 
 /** Tauri command 的错误是字符串，统一成消息文本方便 UI 处理。 */

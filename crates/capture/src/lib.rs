@@ -39,6 +39,8 @@ pub struct CaptureConfig {
     pub min_free_bytes: u64,
     pub record_mic: bool,
     pub record_system: bool,
+    /// 实时转写每段多少秒。只影响内存旁路，不影响落盘分片。
+    pub live_segment_seconds: u32,
 }
 
 impl Default for CaptureConfig {
@@ -49,6 +51,7 @@ impl Default for CaptureConfig {
             min_free_bytes: 2 * 1024 * 1024 * 1024,
             record_mic: true,
             record_system: true,
+            live_segment_seconds: 15,
         }
     }
 }
@@ -121,6 +124,83 @@ pub type LevelSink = Arc<dyn Fn(LevelSample) + Send + Sync>;
 
 /// 实时电平的推送间隔。20 Hz——够顺滑，又不会打爆 Tauri 的 IPC 桥。
 const LEVEL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+
+/// 一段待实时转写的音频。已是 16k 单声道，可直接喂 ASR 引擎。
+///
+/// 走内存旁路而不是落临时文件：样本在 `drain_batches` 里本来就已经重采样好了，
+/// 顺手分一份出来即可。存储侧的分片逻辑完全不受影响——
+/// 录音产物仍然是完整的，实时转写不碰它。
+#[derive(Debug, Clone)]
+pub struct LiveSegment {
+    pub source: Source,
+    /// 本段起点在整轨中的位置（毫秒）。
+    pub start_ms: u32,
+    pub pcm: Pcm,
+}
+
+/// 实时转写旁路。与 `LevelSink` 一样在采集线程内同步调用，必须立刻返回。
+pub type SegmentSink = Arc<dyn Fn(LiveSegment) + Send + Sync>;
+
+/// 攒够一段就交给实时转写。存储分片按 `chunk_seconds` 走，与这里互不干扰。
+struct LiveTap<'a> {
+    sink: Option<&'a SegmentSink>,
+    source: Source,
+    /// 一段多少采样（16k 单声道）。
+    per_segment: usize,
+    buf: Vec<f32>,
+    /// 已经发出去的总采样数，用来算 start_ms。
+    emitted: u64,
+}
+
+impl<'a> LiveTap<'a> {
+    fn new(sink: Option<&'a SegmentSink>, source: Source, segment_seconds: u32) -> Self {
+        let per_segment = (TARGET_SAMPLE_RATE as usize) * (segment_seconds.max(1) as usize);
+        Self {
+            sink,
+            source,
+            per_segment,
+            buf: Vec::with_capacity(per_segment + 4096),
+            emitted: 0,
+        }
+    }
+
+    /// 吃进一批已经重采样成 16k 单声道的样本。
+    fn push(&mut self, samples: &[f32]) {
+        if self.sink.is_none() {
+            return;
+        }
+        self.buf.extend_from_slice(samples);
+        while self.buf.len() >= self.per_segment {
+            let rest = self.buf.split_off(self.per_segment);
+            let batch = std::mem::replace(&mut self.buf, rest);
+            self.emit(batch);
+        }
+    }
+
+    /// 录制结束时把不足一段的尾巴也发出去，否则最后十几秒永远不会进实时稿。
+    fn flush(&mut self) {
+        if self.sink.is_none() || self.buf.is_empty() {
+            return;
+        }
+        let batch = std::mem::take(&mut self.buf);
+        self.emit(batch);
+    }
+
+    fn emit(&mut self, samples: Vec<f32>) {
+        let Some(sink) = self.sink else { return };
+        let len = samples.len() as u64;
+        let start_ms = (self.emitted * 1000 / TARGET_SAMPLE_RATE as u64) as u32;
+        sink(LiveSegment {
+            source: self.source,
+            start_ms,
+            pcm: Pcm {
+                sample_rate: TARGET_SAMPLE_RATE,
+                samples,
+            },
+        });
+        self.emitted += len;
+    }
+}
 
 /// 算一批交织样本的 rms 与峰值。空输入返回全零而不是 NaN。
 fn level_of(buf: &[f32]) -> (f32, f32) {
@@ -301,6 +381,7 @@ mod windows_impl {
         config: &CaptureConfig,
         stop: &StopSignal,
         level: Option<&LevelSink>,
+        segments: Option<&SegmentSink>,
     ) -> Result<TrackOutcome> {
         initialize_mta()
             .ok()
@@ -374,6 +455,7 @@ mod windows_impl {
         let mut raw: VecDeque<u8> = VecDeque::new();
         let mut peak = 0.0f32;
         let mut meter = LevelMeter::new(level, source);
+        let mut tap = LiveTap::new(segments, source, config.live_segment_seconds);
         client
             .start_stream()
             .map_err(|e| CaptureError::Stream(format!("启动流: {e}")))?;
@@ -415,6 +497,7 @@ mod windows_impl {
                 let pcm = decode_and_downsample(&bytes, native_rate)?;
                 peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
                 writer.push(&pcm.samples)?;
+                tap.push(&pcm.samples);
             }
         }
 
@@ -428,8 +511,10 @@ mod windows_impl {
                 let pcm = decode_and_downsample(&bytes[..usable], native_rate)?;
                 peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
                 writer.push(&pcm.samples)?;
+                tap.push(&pcm.samples);
             }
         }
+        tap.flush();
 
         Ok(TrackOutcome {
             chunks: writer.finish()?,
@@ -575,12 +660,16 @@ mod macos_impl {
     }
 
     /// 把攒够的交错样本转成 16k 单声道并落盘，返回这批的峰值。
+    ///
+    /// 重采样后的样本同时喂给 `tap`——实时转写要的就是这份数据，
+    /// 没必要为它再算一遍重采样。
     fn drain_batches(
         pending: &mut Vec<f32>,
         batch_samples: usize,
         channels: usize,
         native_rate: u32,
         writer: &mut ChunkWriter,
+        tap: &mut LiveTap<'_>,
     ) -> Result<f32> {
         let mut peak = 0.0f32;
         while pending.len() >= batch_samples {
@@ -589,6 +678,7 @@ mod macos_impl {
             let pcm = to_target_pcm(&batch, channels, native_rate)?;
             peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
             writer.push(&pcm.samples)?;
+            tap.push(&pcm.samples);
         }
         Ok(peak)
     }
@@ -598,6 +688,7 @@ mod macos_impl {
         config: &CaptureConfig,
         stop: &StopSignal,
         level: Option<&LevelSink>,
+        segments: Option<&SegmentSink>,
     ) -> Result<TrackOutcome> {
         let (device, dev_cfg) = device_for(source)?;
         let channels = (dev_cfg.channels() as usize).max(1);
@@ -649,6 +740,7 @@ mod macos_impl {
         let mut pending: Vec<f32> = Vec::with_capacity(batch_samples * 2);
         let mut peak = 0.0f32;
         let mut meter = LevelMeter::new(level, source);
+        let mut tap = LiveTap::new(segments, source, config.live_segment_seconds);
 
         while !stop.is_stopped() {
             match rx.recv_timeout(Duration::from_millis(200)) {
@@ -662,6 +754,7 @@ mod macos_impl {
                         channels,
                         native_rate,
                         &mut writer,
+                        &mut tap,
                     )?);
                 }
                 // 超时说明这段时间一个回调都没来。macOS 上完全没有音频流过时
@@ -682,6 +775,7 @@ mod macos_impl {
             channels,
             native_rate,
             &mut writer,
+            &mut tap,
         )?);
 
         // 落盘尾部不足一批的数据，长度要对齐到声道数。
@@ -690,7 +784,10 @@ mod macos_impl {
             let pcm = to_target_pcm(&pending[..usable], channels, native_rate)?;
             peak = peak.max(pcm.samples.iter().fold(0.0f32, |m, s| m.max(s.abs())));
             writer.push(&pcm.samples)?;
+            tap.push(&pcm.samples);
         }
+        // 不足一段的尾巴也要发，否则最后十几秒永远进不了实时稿。
+        tap.flush();
 
         Ok(TrackOutcome {
             chunks: writer.finish()?,
@@ -763,6 +860,7 @@ mod fallback_impl {
         _config: &CaptureConfig,
         _stop: &StopSignal,
         _level: Option<&LevelSink>,
+        _segments: Option<&SegmentSink>,
     ) -> Result<TrackOutcome> {
         Err(CaptureError::Unsupported(
             "当前平台不支持音频采集（已支持 Windows 与 macOS 14.6+）".into(),
@@ -790,16 +888,18 @@ pub use fallback_impl::{capture_track, list_devices, probe_loopback};
 /// 两条轨各起一个线程——它们的设备时钟不同步，必须独立驱动。
 /// 时间轴对齐依赖两者近似同时 start，误差目标 <200ms（§8.1 W2–W3 出口标准）。
 pub fn record_dual_track(config: &CaptureConfig, stop: &StopSignal) -> Result<Recording> {
-    record_dual_track_with_levels(config, stop, None)
+    record_dual_track_with_levels(config, stop, None, None)
 }
 
-/// 与 `record_dual_track` 相同，但额外把实时电平推给 `level`。
+/// 与 `record_dual_track` 相同，但额外把实时电平推给 `level`、
+/// 把待实时转写的音频段推给 `segments`。
 ///
-/// GUI 用它画录制中的双轨波形；CLI 不需要，走上面那个薄包装即可。
+/// GUI 用它画录制中的双轨波形与实时逐字稿；CLI 两者都不需要，走上面那个薄包装。
 pub fn record_dual_track_with_levels(
     config: &CaptureConfig,
     stop: &StopSignal,
     level: Option<LevelSink>,
+    segments: Option<SegmentSink>,
 ) -> Result<Recording> {
     let mut out = Recording::default();
 
@@ -807,8 +907,9 @@ pub fn record_dual_track_with_levels(
         let cfg = config.clone();
         let s = stop.clone();
         let lv = level.clone();
+        let sg = segments.clone();
         Some(std::thread::spawn(move || {
-            capture_track(Source::Mic, &cfg, &s, lv.as_ref())
+            capture_track(Source::Mic, &cfg, &s, lv.as_ref(), sg.as_ref())
         }))
     } else {
         None
@@ -818,8 +919,9 @@ pub fn record_dual_track_with_levels(
         let cfg = config.clone();
         let s = stop.clone();
         let lv = level.clone();
+        let sg = segments.clone();
         Some(std::thread::spawn(move || {
-            capture_track(Source::System, &cfg, &s, lv.as_ref())
+            capture_track(Source::System, &cfg, &s, lv.as_ref(), sg.as_ref())
         }))
     } else {
         None
@@ -919,6 +1021,69 @@ mod tests {
         m.tick_idle();
     }
 
+    /// 收集 LiveTap 发出的所有段，供断言。
+    fn collect_tap(segment_seconds: u32, feed: &[usize], flush: bool) -> Vec<LiveSegment> {
+        use std::sync::Mutex;
+        let got: Arc<Mutex<Vec<LiveSegment>>> = Arc::new(Mutex::new(Vec::new()));
+        {
+            let g = got.clone();
+            let sink: SegmentSink = Arc::new(move |s: LiveSegment| g.lock().unwrap().push(s));
+            let mut tap = LiveTap::new(Some(&sink), Source::System, segment_seconds);
+            for &n in feed {
+                tap.push(&vec![0.25f32; n]);
+            }
+            if flush {
+                tap.flush();
+            }
+        }
+        let out = got.lock().unwrap().clone();
+        out
+    }
+
+    #[test]
+    fn live_tap_emits_one_segment_per_configured_span() {
+        let per = TARGET_SAMPLE_RATE as usize; // 1 秒一段
+        let out = collect_tap(1, &[per * 3], false);
+        assert_eq!(out.len(), 3, "喂 3 秒应该出 3 段");
+        for (i, s) in out.iter().enumerate() {
+            assert_eq!(s.pcm.sample_rate, TARGET_SAMPLE_RATE);
+            assert_eq!(s.pcm.samples.len(), per);
+            // 时间戳必须是整轨坐标，否则会后 diarization 对齐会全错位
+            assert_eq!(s.start_ms, i as u32 * 1000, "第 {i} 段的起点");
+        }
+    }
+
+    #[test]
+    fn live_tap_flushes_the_tail() {
+        let per = TARGET_SAMPLE_RATE as usize;
+        // 2.5 秒：两整段 + 半段尾巴
+        let out = collect_tap(1, &[per * 2 + per / 2], true);
+        assert_eq!(out.len(), 3, "不足一段的尾巴也要发，否则最后几秒进不了实时稿");
+        assert_eq!(out[2].pcm.samples.len(), per / 2);
+        assert_eq!(out[2].start_ms, 2000);
+    }
+
+    #[test]
+    fn live_tap_stitches_across_pushes() {
+        let per = TARGET_SAMPLE_RATE as usize;
+        // 分多次喂进来（真实情况就是 250ms 一批），段边界不该因此偏移
+        let quarter = per / 4;
+        let out = collect_tap(1, &[quarter, quarter, quarter, quarter, quarter], true);
+        assert_eq!(out.len(), 2);
+        assert_eq!(out[0].pcm.samples.len(), per);
+        assert_eq!(out[0].start_ms, 0);
+        assert_eq!(out[1].start_ms, 1000);
+    }
+
+    #[test]
+    fn live_tap_is_inert_without_a_sink() {
+        // 关掉实时转写 / CLI 路径：不该攒任何东西
+        let mut tap = LiveTap::new(None, Source::Mic, 1);
+        tap.push(&vec![0.5f32; TARGET_SAMPLE_RATE as usize * 3]);
+        tap.flush();
+        assert!(tap.buf.is_empty(), "没有 sink 时连缓冲都不该增长");
+    }
+
     #[test]
     fn level_meter_emits_on_the_configured_interval() {
         use std::sync::atomic::AtomicUsize;
@@ -941,8 +1106,7 @@ mod tests {
     }
 
     #[test]
-    fn level_metering_does_not_touch_the_silence_threshold_signal() {
-        // 回归锁：静音判定读的是 downmix + 重采样**之后**的信号，
+    fn level_metering_does_not_touch_the_silence_threshold_signal() {        // 回归锁：静音判定读的是 downmix + 重采样**之后**的信号，
         // 电平表读的是之前的交织原始样本。硬声像立体声在两处的读数天然不同，
         // 谁要是图省事把两者并成一套，这个断言会先炸。
         let interleaved = [1.0f32, 0.0, 1.0, 0.0]; // 左满幅、右静音

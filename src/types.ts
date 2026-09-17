@@ -131,6 +131,10 @@ export interface CaptureConfig {
   min_free_bytes: number;
   record_mic: boolean;
   record_system: boolean;
+  /** 会中就逐段转写。关掉即回到「录完再整理」。 */
+  live_transcribe: boolean;
+  /** 实时稿延迟（秒）。只影响内存旁路，不改变录音落盘。 */
+  live_segment_seconds: number;
 }
 
 export interface AppConfig {
@@ -210,6 +214,20 @@ export interface RecordingWarningEvent {
   meeting_id: number;
   kind: string;
   message: string;
+}
+
+/** 实时逐字稿的一行。 */
+export interface LiveLine {
+  start_ms: number;
+  /** 会中拿不到真实说话人身份，只能按轨分「我 / 对方」。 */
+  source: TrackSource;
+  text: string;
+}
+
+/** 会中每转写完一段就推一批。 */
+export interface LiveTranscriptEvent {
+  meeting_id: number;
+  lines: LiveLine[];
 }
 
 /** 字节数变成人看的单位。下载进度里到处要用。 */

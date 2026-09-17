@@ -63,15 +63,26 @@ pub struct JobEvent {
 
 /// 把各阶段进度加权成整体百分比。
 ///
-/// 权重按实测耗时占比粗调：ASR 最重，diarization 次之。W1 拿到真实 RTF 后再校准。
+/// 权重来自实测（2026-09-17，36.4s 双人对话，2 线程、窗步进 0.1）：
+///
+/// | 阶段 | 实测占比 |
+/// | :--- | ---: |
+/// | Vad | 2.9% |
+/// | Asr | 23.7% |
+/// | Diarization | **73.1%** |
+/// | Punctuation | 0.3% |
+///
+/// 这推翻了原先「ASR 最重」的估计——真正的大头是说话人分离。
+/// 旧权重给 ASR 55%、分离 20%，进度条会飞快冲到 70% 再卡住不动，
+/// 而那恰恰是等待时间的绝大部分。模型加载没进上面这次测量，仍按经验留 5%。
 pub fn overall_progress(stage: Stage, fraction: f32) -> f32 {
     let f = fraction.clamp(0.0, 1.0);
     let (base, span) = match stage {
         Stage::LoadingModels => (0.00, 0.05),
-        Stage::Vad => (0.05, 0.10),
-        Stage::Asr => (0.15, 0.55),
-        Stage::Diarization => (0.70, 0.20),
-        Stage::Punctuation => (0.90, 0.09),
+        Stage::Vad => (0.05, 0.03),
+        Stage::Asr => (0.08, 0.22),
+        Stage::Diarization => (0.30, 0.68),
+        Stage::Punctuation => (0.98, 0.02),
         Stage::Done => (1.00, 0.00),
     };
     (base + span * f).clamp(0.0, 1.0)
@@ -100,7 +111,17 @@ mod tests {
 
     #[test]
     fn progress_is_clamped() {
-        assert_eq!(overall_progress(Stage::Asr, -5.0), 0.15);
+        // 负数收敛到该阶段的起点、超过 1 收敛到终点。
+        // 不写死具体数值——权重是照实测调的，会随校准变化，
+        // 写死的话每次校准都要改测试，反而掩盖真正的回归。
+        assert_eq!(
+            overall_progress(Stage::Asr, -5.0),
+            overall_progress(Stage::Asr, 0.0)
+        );
+        assert_eq!(
+            overall_progress(Stage::Asr, 99.0),
+            overall_progress(Stage::Asr, 1.0)
+        );
         assert!(overall_progress(Stage::Asr, 99.0) <= 1.0);
     }
 

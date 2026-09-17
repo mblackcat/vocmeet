@@ -213,6 +213,8 @@ fn record(
         min_free_bytes: config.capture.min_free_bytes,
         record_mic: !system_only,
         record_system: !mic_only,
+        // CLI 不做实时转写，这个值用不到。
+        live_segment_seconds: config.capture.live_segment_seconds,
     };
 
     let stop = vocmeet_capture::StopSignal::new();

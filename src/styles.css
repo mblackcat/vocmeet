@@ -265,6 +265,52 @@ h2.section {
   font-size: 12px; line-height: 1.7; color: var(--live); font-weight: 300;
 }
 
+/* ---------- 会中实时逐字稿 ---------- */
+
+/* 录制中中间区改成上下结构：稿子占满，电平与操作沉到底部一行。
+   录制之外仍是原来的居中布局，所以只在 .recording 下改。 */
+.center.recording {
+  align-items: stretch; justify-content: flex-start;
+  padding: 28px 40px 0;
+}
+
+.live-head { flex: 0 0 auto; padding-bottom: 14px; border-bottom: 1px solid var(--rule); }
+.live-name {
+  font-family: var(--font-display); font-weight: 200;
+  font-size: 17px; letter-spacing: 0.1em; color: var(--ink-2);
+}
+
+.live-script {
+  flex: 1; min-height: 0; overflow-y: auto;
+  padding: 18px 0 8px;
+  display: flex; flex-direction: column; gap: 12px;
+}
+.live-idle { margin: 0; font-size: 13px; color: var(--ink-3); font-weight: 300; }
+
+.live-line { display: flex; gap: 14px; align-items: baseline; }
+/* 说话人标签定宽，多行文本才能对齐成一栏 */
+.live-line .who {
+  flex: 0 0 auto; width: 32px; text-align: right;
+  font-size: 11px; letter-spacing: 0.1em; color: var(--ink-3); font-weight: 300;
+}
+.live-line .who.me { color: var(--signal); }
+.live-line .said {
+  flex: 1; font-size: 14px; line-height: 1.85; color: var(--ink);
+  font-weight: 300; white-space: pre-wrap; word-break: break-word;
+}
+
+.live-foot {
+  flex: 0 0 auto;
+  display: flex; align-items: center; gap: 24px;
+  padding: 14px 0 18px; border-top: 1px solid var(--rule);
+}
+/* 稿子上位之后电平表退成辅助信息，但保留双轨对比 */
+.meter.compact { max-width: 240px; gap: 5px; }
+.meter.compact .meter-bars { height: 16px; }
+.meter.compact .meter-label { width: 34px; font-size: 10px; }
+.live-foot .elapsed { margin-top: 0; margin-left: auto; }
+.live-foot .record { flex-direction: row; gap: 10px; }
+
 .elapsed {
   font-family: var(--font-data); font-size: 13px; letter-spacing: 0.14em;
   color: var(--ink-2); margin-top: 10px;

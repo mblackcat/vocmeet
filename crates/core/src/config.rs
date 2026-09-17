@@ -70,6 +70,8 @@ pub struct EngineConfig {
     pub cluster_threshold: f32,
     pub merge_gap_ms: u32,
     pub max_speech_duration: f32,
+    /// 说话人分离的分割窗步进比例。越小越细、越慢——它是整条链路的瓶颈。
+    pub diar_window_shift_ratio: f32,
 }
 
 impl Default for EngineConfig {
@@ -81,6 +83,7 @@ impl Default for EngineConfig {
             cluster_threshold: d.cluster_threshold,
             merge_gap_ms: d.merge_gap_ms,
             max_speech_duration: d.max_speech_duration,
+            diar_window_shift_ratio: d.diar_window_shift_ratio,
         }
     }
 }
@@ -93,6 +96,7 @@ impl EngineConfig {
             cluster_threshold: self.cluster_threshold,
             merge_gap_ms: self.merge_gap_ms,
             max_speech_duration: self.max_speech_duration,
+            diar_window_shift_ratio: self.diar_window_shift_ratio,
             ..EngineOptions::default()
         }
     }
@@ -107,6 +111,16 @@ pub struct CaptureConfig {
     pub min_free_bytes: u64,
     pub record_mic: bool,
     pub record_system: bool,
+    /// 会中就逐段转写，实时更新逐字稿。
+    ///
+    /// 会把 VAD + ASR（约占整体耗时 65%，见 `jobs::overall_progress`）摊到会议过程中，
+    /// 会后只剩说话人分离与标点。代价是录制期间引擎会占 CPU，
+    /// 低配机器上如果影响到采集，关掉即可回到「录完再整理」。
+    pub live_transcribe: bool,
+    /// 实时转写每段多少秒——也就是实时稿的延迟。
+    ///
+    /// 只影响内存旁路，**不影响落盘分片**：录音仍按 `chunk_seconds` 存，产物完整。
+    pub live_segment_seconds: u32,
 }
 
 impl Default for CaptureConfig {
@@ -116,6 +130,8 @@ impl Default for CaptureConfig {
             min_free_bytes: 2 * 1024 * 1024 * 1024, // 2GB
             record_mic: true,
             record_system: true,
+            live_transcribe: true,
+            live_segment_seconds: 15,
         }
     }
 }

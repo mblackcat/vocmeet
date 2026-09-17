@@ -496,6 +496,54 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
               <div className="note">每隔指定秒数音频自动落盘一次，断电或异常最多损失一个分片</div>
             </span>
           </div>
+          <div className="set-row">
+            <span className="k">会中实时转写</span>
+            <span className="v">
+              <label className="choice" style={{ padding: 0 }}>
+                <input
+                  type="checkbox"
+                  checked={cfg.capture.live_transcribe}
+                  onChange={(e) => {
+                    const next = {
+                      ...cfg,
+                      capture: { ...cfg.capture, live_transcribe: e.target.checked },
+                    };
+                    patch({ capture: next.capture });
+                    void persist(next);
+                  }}
+                />
+                <span className="c-t">开会过程中就逐段转成文字</span>
+              </label>
+              <div className="note">
+                把识别的大头（VAD 与 ASR，约占整体耗时三分之二）摊到会议过程中，
+                会后只剩说话人分离和标点，整理明显更快。代价是录制时会占用 CPU——
+                低配机器上如果影响到录音，关掉即可回到「录完再整理」。
+              </div>
+            </span>
+          </div>
+          <div className="set-row">
+            <span className="k">实时稿延迟 (秒)</span>
+            <span className="v">
+              <input
+                type="number"
+                value={cfg.capture.live_segment_seconds}
+                disabled={!cfg.capture.live_transcribe}
+                onChange={(e) =>
+                  patch({
+                    capture: {
+                      ...cfg.capture,
+                      live_segment_seconds: Number(e.target.value),
+                    },
+                  })
+                }
+                onBlur={() => void persist(cfg)}
+              />
+              <div className="note">
+                每攒够这么多秒就转写一次，也就是文字出现的延迟。
+                只影响内存里的处理节奏，<strong>不改变录音落盘方式</strong>，录音文件仍然完整。
+              </div>
+            </span>
+          </div>
         </div>
 
         {/* 2. 逐字稿的来去（落盘目录修改，移除原有仅本机和任意端点单选项） */}
