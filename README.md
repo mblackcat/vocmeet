@@ -54,7 +54,13 @@ VocMeet 会在录制结束后检查系统轨，没采到声音时给出明确警
 那一次麦克风轨会比系统轨短 3 秒左右（实测 8.570s vs 11.748s）。之后每次录制都稳定在 25ms 以内。
 重要的会议建议先空录几秒，把这一次性开销跑掉。
 
-安装包未签名公证，首次打开需要 `xattr -dr com.apple.quarantine /Applications/VocMeet.app` 放行。
+安装包做了 ad-hoc 签名但没有 Apple 公证，首次打开会提示「无法验证开发者」：
+把 VocMeet.app 拖进「应用程序」后**右键点图标选「打开」**，在弹窗里再确认一次「打开」即可，
+之后正常双击。也可以直接 `xattr -dr com.apple.quarantine /Applications/VocMeet.app` 一次性放行。
+
+> v0.3.0 及之前的 macOS 安装包漏了 ad-hoc 签名（只有可执行文件被链接器签了名，
+> .app 外壳缺 `_CodeSignature/CodeResources`），Gatekeeper 会判成签名损坏、
+> 直接弹「已损坏，无法打开」且不给放行入口。碰到这个提示只能用上面的 `xattr` 命令绕过。
 
 界面分五页：**录制**（开始/停止、会中速记 Scratchpad、发起转写并看进度）、
 **逐字稿**（说话人命名、低置信片段高亮、就地校对、导出）、
