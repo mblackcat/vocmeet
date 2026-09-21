@@ -48,10 +48,16 @@ jobs:
       # 原因同 ci.yml：rust-cache 存缓存前会清掉 target/sherpa-onnx-prebuilt/ 里的静态库，
       # 只留空目录，下次构建误以为已下载过，链接直接失败。单独缓存这个目录来兜底。
       - name: Cache sherpa-onnx prebuilt libs
+        id: sherpa-cache
         uses: actions/cache@v4
         with:
           path: target/sherpa-onnx-prebuilt
           key: sherpa-onnx-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      - name: Purge stale sherpa-onnx dir on cache miss
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
 
       - name: Install Frontend Dependencies
         run: npm ci

@@ -53,10 +53,18 @@ jobs:
       # 单独给这个目录上缓存：declare 在 rust-cache 之后，靠 post-step 反序执行，
       # 保证这里的 save 在 rust-cache 的清理之前跑，存下来的是完整文件。
       - name: Cache sherpa-onnx prebuilt libs
+        id: sherpa-cache
         uses: actions/cache@v4
         with:
           path: target/sherpa-onnx-prebuilt
           key: sherpa-onnx-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
+      # 没命中上面这层专门的缓存，说明 target/ 里现在这份是 rust-cache 清理后留下的
+      # 空壳目录，得清掉逼 build.rs 重新下载，否则它会误以为已经装好，链接直接失败。
+      - name: Purge stale sherpa-onnx dir on cache miss
+        if: steps.sherpa-cache.outputs.cache-hit != 'true'
+        shell: bash
+        run: rm -rf target/sherpa-onnx-prebuilt
 
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
