@@ -59,6 +59,11 @@ struct AppState {
     model_fetch_cancel: Mutex<Option<CancelToken>>,
     /// 是否正在让 Ollama 拉模型。拉取由 Ollama 自己完成，我们只能防重入。
     llm_pulling: Mutex<bool>,
+    /// 最近一次 `check_update` 查到的可用更新，供 `install_update` 直接取用。
+    /// 装哪个包由后端自己说了算，不接受前端传来的任意 URL/文件名。
+    pending_update: Mutex<Option<vocmeet_core::update::UpdateCheck>>,
+    /// 正在进行的更新下载的取消令牌，兼防重入。
+    update_cancel: Mutex<Option<CancelToken>>,
 }
 
 impl AppState {
@@ -2151,6 +2156,206 @@ fn set_tray_recording(app: &AppHandle, recording: bool) {
     }
 }
 
+// ---------------------------------------------------------------- 命令：检查更新
+//
+// 不走 Tauri 官方 updater（要求维护签名密钥）。仓库是 public 的，
+// 直接读 GitHub Releases 的公开 API 就够了——下载下来的就是官方 Release
+// 附件本身，交给系统自带的安装器去装。
+//
+// `install_update` 不接受前端传来的 URL/文件名：那样等于给 webview 开了个
+// 「下载任意地址并直接执行」的口子。实际装哪个包，只认后端自己在
+// `check_update` 里查到、存进 `AppState.pending_update` 的那份。
+
+const UPDATE_REPO: &str = "mblackcat/vocmeet";
+
+#[derive(Serialize)]
+struct UpdateCheckPayload {
+    available: bool,
+    newer_version_exists: bool,
+    current_version: String,
+    latest_version: String,
+    notes: String,
+    asset_name: Option<String>,
+}
+
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle, state: State<'_, AppState>) -> R<UpdateCheckPayload> {
+    let current = app.package_info().version.to_string();
+    let info = vocmeet_core::update::check_latest(UPDATE_REPO, &current)
+        .await
+        .map_err(err)?;
+
+    let payload = UpdateCheckPayload {
+        available: info.available,
+        newer_version_exists: info.newer_version_exists,
+        current_version: current,
+        latest_version: info.latest_version.clone(),
+        notes: info.notes.clone(),
+        asset_name: info.asset_name.clone(),
+    };
+    *state.pending_update.lock().map_err(|_| "更新状态锁中毒")? = Some(info);
+    Ok(payload)
+}
+
+#[derive(Serialize, Clone)]
+struct UpdateProgressEvent {
+    received: u64,
+    total: Option<u64>,
+}
+
+#[derive(Serialize, Clone)]
+struct UpdateDoneEvent {
+    ok: bool,
+    message: String,
+}
+
+/// 下载地址是否落在 GitHub 自己的域名上——`check_latest` 已经只从
+/// GitHub API 响应里取 `browser_download_url`，这里是双保险，不指望它真的拦到什么。
+fn is_trusted_release_host(url: &str) -> bool {
+    let Some(rest) = url.strip_prefix("https://") else {
+        return false;
+    };
+    let host = rest.split(['/', '?', '#']).next().unwrap_or("");
+    host == "github.com" || host.ends_with(".github.com") || host.ends_with("githubusercontent.com")
+}
+
+#[tauri::command]
+fn install_update(app: AppHandle, state: State<AppState>) -> R<()> {
+    if state
+        .update_cancel
+        .lock()
+        .map_err(|_| "更新锁中毒")?
+        .is_some()
+    {
+        return Err("已经在安装了".into());
+    }
+
+    let pending = state
+        .pending_update
+        .lock()
+        .map_err(|_| "更新状态锁中毒")?
+        .clone();
+    let pending = pending.ok_or("请先点「检查更新」")?;
+    if !pending.available {
+        return Err("没有可安装的更新".into());
+    }
+    let asset_url = pending.asset_url.ok_or("没有可安装的更新")?;
+    let asset_name = pending.asset_name.ok_or("没有可安装的更新")?;
+
+    if !is_trusted_release_host(&asset_url) {
+        return Err("更新地址不受信任，已拒绝".into());
+    }
+    // 只取文件名部分，防止路径穿越（`../../` 之类）逃出临时目录。
+    let safe_name = std::path::Path::new(&asset_name)
+        .file_name()
+        .ok_or("非法的更新文件名")?
+        .to_owned();
+    let dst = std::env::temp_dir().join(safe_name);
+
+    let cancel = CancelToken::new();
+    *state.update_cancel.lock().map_err(|_| "更新锁中毒")? = Some(cancel.clone());
+
+    std::thread::spawn(move || {
+        let progress_app = app.clone();
+        let outcome = tokio::runtime::Runtime::new()
+            .map_err(|e| e.to_string())
+            .and_then(|rt| {
+                rt.block_on(vocmeet_core::update::download_update(
+                    &asset_url,
+                    &dst,
+                    |received, total| {
+                        let _ = progress_app.emit(
+                            "update-download-progress",
+                            UpdateProgressEvent { received, total },
+                        );
+                    },
+                    &|| cancel.is_cancelled(),
+                ))
+                .map_err(|e| e.to_string())
+            })
+            .and_then(|()| launch_installer(&dst));
+
+        let message = match &outcome {
+            Ok(()) => "安装程序已启动，应用即将关闭以完成更新…".to_string(),
+            Err(e) => e.clone(),
+        };
+        let _ = app.emit(
+            "update-install-done",
+            UpdateDoneEvent {
+                ok: outcome.is_ok(),
+                message,
+            },
+        );
+
+        if let Some(state) = app.try_state::<AppState>() {
+            if let Ok(mut g) = state.update_cancel.lock() {
+                *g = None;
+            }
+        }
+
+        if outcome.is_ok() {
+            // 给安装器一点时间把自己跑起来，再退出好释放当前 exe 的文件锁。
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            app.exit(0);
+        }
+    });
+
+    Ok(())
+}
+
+#[tauri::command]
+fn cancel_update_install(state: State<AppState>) -> R<()> {
+    if let Some(c) = state
+        .update_cancel
+        .lock()
+        .map_err(|_| "更新锁中毒")?
+        .as_ref()
+    {
+        c.cancel();
+    }
+    Ok(())
+}
+
+fn launch_installer(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "msi" {
+            std::process::Command::new("msiexec")
+                .arg("/i")
+                .arg(path)
+                .spawn()
+                .map_err(err)?;
+        } else {
+            std::process::Command::new(path).spawn().map_err(err)?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(err)?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- 入口
 
 fn now_iso() -> String {
@@ -2253,6 +2458,8 @@ fn main() {
             last_chunks: Arc::new(Mutex::new(None)),
             model_fetch_cancel: Mutex::new(None),
             llm_pulling: Mutex::new(false),
+            pending_update: Mutex::new(None),
+            update_cancel: Mutex::new(None),
         })
         .invoke_handler(tauri::generate_handler![
             doctor,
@@ -2303,6 +2510,10 @@ fn main() {
             test_llm_connection,
             audit_count,
             egress_policy_labels,
+            app_version,
+            check_update,
+            install_update,
+            cancel_update_install,
         ])
         .run(tauri::generate_context!())
         .expect("启动 VocMeet 失败");

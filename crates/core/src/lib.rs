@@ -23,6 +23,7 @@ pub mod models;
 pub mod policy;
 pub mod store;
 pub mod summarize;
+pub mod update;
 
 pub use error::{Error, Result};
 
