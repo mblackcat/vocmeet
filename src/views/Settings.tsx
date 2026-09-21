@@ -12,6 +12,7 @@ import type {
   PullEvent,
   SuggestedModel,
   UpdateCheckPayload,
+  UpdateProgressEvent,
 } from "../types";
 import { formatBytes, formatTs } from "../types";
 import QuickNav from "../components/QuickNav";
@@ -134,9 +135,7 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   const [updateCheck, setUpdateCheck] = useState<UpdateCheckPayload | null>(null);
   const [checkingUpdate, setCheckingUpdate] = useState(false);
   const [installingUpdate, setInstallingUpdate] = useState(false);
-  const [updateProgress, setUpdateProgress] = useState<{ received: number; total: number | null } | null>(
-    null,
-  );
+  const [updateProgress, setUpdateProgress] = useState<UpdateProgressEvent | null>(null);
 
   const loadArchived = async () => {
     try {
@@ -187,15 +186,24 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   };
 
   useEffect(() => {
-    void api.appVersion().then(setAppVersion);
-  }, []);
+    void api
+      .appVersion()
+      .then(setAppVersion)
+      .catch((e) => onError(asMessage(e)));
+  }, [onError]);
 
   useEffect(() => {
     const off: Array<() => void> = [];
     void events.onModelsProgress(setFetching).then((f) => off.push(f));
     void events.onPullProgress(setPulling).then((f) => off.push(f));
+    void events.onUpdateProgress(setUpdateProgress).then((f) => off.push(f));
     void events
-      .onUpdateProgress((e) => setUpdateProgress({ received: e.received, total: e.total }))
+      .onUpdateInstallDone((e) => {
+        setInstallingUpdate(false);
+        setUpdateProgress(null);
+        setMsg(e.message);
+        if (!e.ok) onError(e.message);
+      })
       .then((f) => off.push(f));
     void events
       .onPullDone((e) => {
@@ -260,11 +268,16 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   const patch = (p: Partial<AppConfig>) => setCfg({ ...cfg, ...p });
 
   const persist = async (next: AppConfig) => {
+    const llmChanged =
+      JSON.stringify(next.llm) !== JSON.stringify(cfg.llm) ||
+      next.egress_policy !== cfg.egress_policy;
     setCfg(next);
     try {
       await api.saveConfig(next);
       setMsg("已保存");
-      void api.diagnoseLlm().then(setLlm).catch(() => {});
+      if (llmChanged) {
+        void api.diagnoseLlm().then(setLlm).catch(() => {});
+      }
     } catch (e) {
       onError(asMessage(e));
     }
@@ -276,11 +289,12 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
     try {
       const u = await api.checkUpdate();
       setAppVersion(u.current_version);
+      setUpdateCheck(u);
       if (u.available) {
-        setUpdateCheck(u);
         setMsg(`发现新版本 v${u.latest_version}，点击「安装更新」下载安装`);
+      } else if (u.newer_version_exists) {
+        setMsg(`发现新版本 v${u.latest_version}，但没有找到适配当前系统的安装包，请前往 GitHub Releases 手动下载`);
       } else {
-        setUpdateCheck(null);
         setMsg("已经是最新版");
       }
     } catch (e) {
@@ -291,18 +305,22 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   };
 
   const handleInstallUpdate = async () => {
-    if (!updateCheck?.asset_url || !updateCheck.asset_name) return;
+    if (!updateCheck?.available) return;
     setInstallingUpdate(true);
     setUpdateProgress({ received: 0, total: null });
     setMsg(null);
     try {
-      await api.installUpdate(updateCheck.asset_url, updateCheck.asset_name);
-      setMsg("安装程序已启动，应用即将关闭以完成更新…");
+      // install_update 立刻返回：下载/安装在后台线程跑，结果走 update-install-done 事件。
+      await api.installUpdate();
     } catch (e) {
       onError(asMessage(e));
       setInstallingUpdate(false);
       setUpdateProgress(null);
     }
+  };
+
+  const handleCancelInstallUpdate = () => {
+    void api.cancelUpdateInstall().catch((e) => onError(asMessage(e)));
   };
 
   const test = async () => {
@@ -444,16 +462,26 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
                 )}
               </div>
             )}
+            {updateCheck && !updateCheck.available && updateCheck.newer_version_exists && (
+              <div className="note">发现新版本 v{updateCheck.latest_version}，但没有适配当前系统的安装包</div>
+            )}
           </span>
           {updateCheck?.available ? (
-            <button
-              type="button"
-              className="act"
-              disabled={installingUpdate}
-              onClick={() => void handleInstallUpdate()}
-            >
-              {installingUpdate ? "安装中…" : "安装更新"}
-            </button>
+            <div style={{ display: "flex", gap: 8 }}>
+              {installingUpdate && (
+                <button type="button" className="act" onClick={handleCancelInstallUpdate}>
+                  取消
+                </button>
+              )}
+              <button
+                type="button"
+                className="act"
+                disabled={installingUpdate}
+                onClick={() => void handleInstallUpdate()}
+              >
+                {installingUpdate ? "安装中…" : "安装更新"}
+              </button>
+            </div>
           ) : (
             <button
               type="button"

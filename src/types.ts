@@ -196,16 +196,21 @@ export type SuggestedModel = [string, string, number];
 /** 检查更新的结果：直接读 GitHub Releases，不涉及任何签名密钥。 */
 export interface UpdateCheckPayload {
   available: boolean;
+  newer_version_exists: boolean;
   current_version: string;
   latest_version: string;
   notes: string;
-  asset_url: string | null;
   asset_name: string | null;
 }
 
 export interface UpdateProgressEvent {
   received: number;
   total: number | null;
+}
+
+export interface UpdateDoneEvent {
+  ok: boolean;
+  message: string;
 }
 
 /** 字节数变成人看的单位。下载进度里到处要用。 */
