@@ -134,8 +134,8 @@ fn detect_asset_arch(lower_name: &str) -> Option<&'static str> {
 /// 按当前系统 + 架构挑一个能直接装的附件。
 ///
 /// 架构不匹配的直接排除（避免把 arm64 包装到 x64 机器上），架构不明的
-/// （没在文件名里标出来的通用包）当兜底保留；同架构里 .exe 优先于 .msi，
-/// 免交互，双击即走。
+/// （没在文件名里标出来的通用包）当兜底保留；同架构里 Windows 下 .exe 优先于 .msi，
+/// Linux 下 .AppImage 优先于 .deb/.rpm，免交互，双击即走。
 fn pick_asset<'a>(assets: &'a [GhAsset], os: TargetOs, arch: &str) -> Option<&'a GhAsset> {
     let named: Vec<(String, &GhAsset)> = assets
         .iter()
@@ -151,10 +151,26 @@ fn pick_asset<'a>(assets: &'a [GhAsset], os: TargetOs, arch: &str) -> Option<&'a
         .into_iter()
         .min_by_key(|(name, _)| {
             let arch_rank: u8 = u8::from(detect_asset_arch(name).is_none());
-            let ext_rank: u8 = u8::from(name.ends_with(".msi"));
+            let ext_rank: u8 = ext_rank(name, os);
             (arch_rank, ext_rank)
         })
         .map(|(_, a)| a)
+}
+
+fn ext_rank(lower_name: &str, os: TargetOs) -> u8 {
+    match os {
+        TargetOs::Windows => u8::from(lower_name.ends_with(".msi")),
+        TargetOs::MacOs => 0,
+        TargetOs::Linux => {
+            if lower_name.ends_with(".appimage") {
+                0
+            } else if lower_name.ends_with(".deb") {
+                1
+            } else {
+                2
+            }
+        }
+    }
 }
 
 /// 版本号比较优先走标准 semver（正确处理 `1.0.0-rc.1 < 1.0.0` 这种预发布语义）。
@@ -323,6 +339,16 @@ mod tests {
         ];
         let picked = pick_asset(&assets, TargetOs::Linux, "x86_64").unwrap();
         assert!(picked.name.to_ascii_lowercase().ends_with(".appimage"));
+    }
+
+    #[test]
+    fn asset_pick_linux_prefers_deb_over_rpm() {
+        let assets = vec![
+            asset("VocMeet_0.3.1_amd64.rpm"),
+            asset("VocMeet_0.3.1_amd64.deb"),
+        ];
+        let picked = pick_asset(&assets, TargetOs::Linux, "x86_64").unwrap();
+        assert!(picked.name.to_ascii_lowercase().ends_with(".deb"));
     }
 
     #[test]
