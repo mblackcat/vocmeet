@@ -1780,6 +1780,104 @@ fn egress_policy_labels() -> Vec<(String, String)> {
     ]
 }
 
+// ---------------------------------------------------------------- 命令：检查更新
+//
+// 不走 Tauri 官方 updater（要求维护签名密钥）。仓库是 public 的，
+// 直接读 GitHub Releases 的公开 API 就够了——下载下来的就是官方 Release
+// 附件本身，交给系统自带的安装器去装。
+
+const UPDATE_REPO: &str = "mblackcat/vocmeet";
+
+#[derive(Serialize)]
+struct UpdateCheckPayload {
+    available: bool,
+    current_version: String,
+    latest_version: String,
+    notes: String,
+    asset_url: Option<String>,
+    asset_name: Option<String>,
+}
+
+#[tauri::command]
+fn app_version(app: AppHandle) -> String {
+    app.package_info().version.to_string()
+}
+
+#[tauri::command]
+async fn check_update(app: AppHandle) -> R<UpdateCheckPayload> {
+    let current = app.package_info().version.to_string();
+    let info = vocmeet_core::update::check_latest(UPDATE_REPO, &current)
+        .await
+        .map_err(err)?;
+    Ok(UpdateCheckPayload {
+        available: info.available,
+        current_version: current,
+        latest_version: info.latest_version,
+        notes: info.notes,
+        asset_url: info.asset_url,
+        asset_name: info.asset_name,
+    })
+}
+
+#[derive(Serialize, Clone)]
+struct UpdateProgressEvent {
+    received: u64,
+    total: Option<u64>,
+}
+
+#[tauri::command]
+async fn install_update(app: AppHandle, asset_url: String, asset_name: String) -> R<()> {
+    let dst = std::env::temp_dir().join(&asset_name);
+    let progress_app = app.clone();
+    vocmeet_core::update::download_update(&asset_url, &dst, move |received, total| {
+        let _ = progress_app.emit("update-download-progress", UpdateProgressEvent { received, total });
+    })
+    .await
+    .map_err(err)?;
+
+    launch_installer(&dst).map_err(err)?;
+
+    // 给安装器一点时间把自己跑起来，再退出好释放当前 exe 的文件锁。
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    app.exit(0);
+    Ok(())
+}
+
+fn launch_installer(path: &std::path::Path) -> Result<(), String> {
+    #[cfg(target_os = "windows")]
+    {
+        let ext = path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if ext == "msi" {
+            std::process::Command::new("msiexec")
+                .arg("/i")
+                .arg(path)
+                .spawn()
+                .map_err(err)?;
+        } else {
+            std::process::Command::new(path).spawn().map_err(err)?;
+        }
+    }
+    #[cfg(target_os = "macos")]
+    {
+        std::process::Command::new("open")
+            .arg(path)
+            .spawn()
+            .map_err(err)?;
+    }
+    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
+    {
+        std::process::Command::new("xdg-open")
+            .arg(path)
+            .spawn()
+            .map_err(err)?;
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- 入口
 
 fn now_iso() -> String {
@@ -1928,6 +2026,9 @@ fn main() {
             test_llm_connection,
             audit_count,
             egress_policy_labels,
+            app_version,
+            check_update,
+            install_update,
         ])
         .run(tauri::generate_context!())
         .expect("启动 VocMeet 失败");

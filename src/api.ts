@@ -20,6 +20,8 @@ import type {
   StopResult,
   Utterance,
   ParticipantInfo,
+  UpdateCheckPayload,
+  UpdateProgressEvent,
 } from "./types";
 
 export const api = {
@@ -115,6 +117,13 @@ export const api = {
   testLlmConnection: () => invoke<string>("test_llm_connection"),
   auditCount: () => invoke<number>("audit_count"),
   egressPolicyLabels: () => invoke<[string, string][]>("egress_policy_labels"),
+
+  appVersion: () => invoke<string>("app_version"),
+  /** 直接读 GitHub Releases 判断有没有新版本，全程无密钥、无签名校验。 */
+  checkUpdate: () => invoke<UpdateCheckPayload>("check_update"),
+  /** 下载 Release 附件并拉起系统自带的安装器（NSIS/MSI/DMG）。 */
+  installUpdate: (assetUrl: string, assetName: string) =>
+    invoke<void>("install_update", { assetUrl, assetName }),
 };
 
 export const events = {
@@ -138,6 +147,8 @@ export const events = {
     listen<PullEvent>("llm-pull-progress", (e) => cb(e.payload)),
   onPullDone: (cb: (e: DoneEvent) => void): Promise<UnlistenFn> =>
     listen<DoneEvent>("llm-pull-done", (e) => cb(e.payload)),
+  onUpdateProgress: (cb: (e: UpdateProgressEvent) => void): Promise<UnlistenFn> =>
+    listen<UpdateProgressEvent>("update-download-progress", (e) => cb(e.payload)),
 };
 
 /** Tauri command 的错误是字符串，统一成消息文本方便 UI 处理。 */

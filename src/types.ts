@@ -193,6 +193,21 @@ export interface PullEvent {
 /** 一个可选模型：[名字, 说明, 上下文长度]。 */
 export type SuggestedModel = [string, string, number];
 
+/** 检查更新的结果：直接读 GitHub Releases，不涉及任何签名密钥。 */
+export interface UpdateCheckPayload {
+  available: boolean;
+  current_version: string;
+  latest_version: string;
+  notes: string;
+  asset_url: string | null;
+  asset_name: string | null;
+}
+
+export interface UpdateProgressEvent {
+  received: number;
+  total: number | null;
+}
+
 /** 字节数变成人看的单位。下载进度里到处要用。 */
 export function formatBytes(n: number): string {
   if (n < 1024) return `${n} B`;

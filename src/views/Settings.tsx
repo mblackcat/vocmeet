@@ -11,6 +11,7 @@ import type {
   ModelPlan,
   PullEvent,
   SuggestedModel,
+  UpdateCheckPayload,
 } from "../types";
 import { formatBytes, formatTs } from "../types";
 import QuickNav from "../components/QuickNav";
@@ -129,6 +130,14 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   const [archivedList, setArchivedList] = useState<Meeting[]>([]);
   const [newTerm, setNewTerm] = useState("");
 
+  const [appVersion, setAppVersion] = useState("");
+  const [updateCheck, setUpdateCheck] = useState<UpdateCheckPayload | null>(null);
+  const [checkingUpdate, setCheckingUpdate] = useState(false);
+  const [installingUpdate, setInstallingUpdate] = useState(false);
+  const [updateProgress, setUpdateProgress] = useState<{ received: number; total: number | null } | null>(
+    null,
+  );
+
   const loadArchived = async () => {
     try {
       const list = await api.listArchivedMeetings();
@@ -178,9 +187,16 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   };
 
   useEffect(() => {
+    void api.appVersion().then(setAppVersion);
+  }, []);
+
+  useEffect(() => {
     const off: Array<() => void> = [];
     void events.onModelsProgress(setFetching).then((f) => off.push(f));
     void events.onPullProgress(setPulling).then((f) => off.push(f));
+    void events
+      .onUpdateProgress((e) => setUpdateProgress({ received: e.received, total: e.total }))
+      .then((f) => off.push(f));
     void events
       .onPullDone((e) => {
         setPulling(null);
@@ -248,8 +264,44 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
     try {
       await api.saveConfig(next);
       setMsg("已保存");
+      void api.diagnoseLlm().then(setLlm).catch(() => {});
     } catch (e) {
       onError(asMessage(e));
+    }
+  };
+
+  const handleCheckUpdate = async () => {
+    setCheckingUpdate(true);
+    setMsg(null);
+    try {
+      const u = await api.checkUpdate();
+      setAppVersion(u.current_version);
+      if (u.available) {
+        setUpdateCheck(u);
+        setMsg(`发现新版本 v${u.latest_version}，点击「安装更新」下载安装`);
+      } else {
+        setUpdateCheck(null);
+        setMsg("已经是最新版");
+      }
+    } catch (e) {
+      onError(asMessage(e));
+    } finally {
+      setCheckingUpdate(false);
+    }
+  };
+
+  const handleInstallUpdate = async () => {
+    if (!updateCheck?.asset_url || !updateCheck.asset_name) return;
+    setInstallingUpdate(true);
+    setUpdateProgress({ received: 0, total: null });
+    setMsg(null);
+    try {
+      await api.installUpdate(updateCheck.asset_url, updateCheck.asset_name);
+      setMsg("安装程序已启动，应用即将关闭以完成更新…");
+    } catch (e) {
+      onError(asMessage(e));
+      setInstallingUpdate(false);
+      setUpdateProgress(null);
     }
   };
 
@@ -333,7 +385,6 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
     };
     await persist(next);
     setMsg(`已切换为「${p.name}」配置模板`);
-    void api.diagnoseLlm().then(setLlm).catch(() => {});
   };
 
   const addTerm = (term: string) => {
@@ -373,6 +424,46 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
       <div className="doc">
         <div className="meeting-head" id="set-header">
           <h2>设置</h2>
+        </div>
+
+        <div className="check" style={{ marginBottom: 14 }}>
+          <span className="d" style={{ flex: 1 }}>
+            当前版本 v{appVersion || "…"}
+            {updateCheck?.available && (
+              <div className="note">
+                发现新版本 v{updateCheck.latest_version}
+                {updateProgress && updateProgress.total && updateProgress.total > 0 && (
+                  <div className="thin-bar" style={{ width: "100%", marginTop: 6 }}>
+                    <div
+                      className="fill"
+                      style={{
+                        width: `${Math.min(100, Math.round((updateProgress.received / updateProgress.total) * 100))}%`,
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+          </span>
+          {updateCheck?.available ? (
+            <button
+              type="button"
+              className="act"
+              disabled={installingUpdate}
+              onClick={() => void handleInstallUpdate()}
+            >
+              {installingUpdate ? "安装中…" : "安装更新"}
+            </button>
+          ) : (
+            <button
+              type="button"
+              className="act"
+              disabled={checkingUpdate}
+              onClick={() => void handleCheckUpdate()}
+            >
+              {checkingUpdate ? "检查中…" : "检查更新"}
+            </button>
+          )}
         </div>
 
         {msg && <div className="msg">{msg}</div>}
