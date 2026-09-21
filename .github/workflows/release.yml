@@ -45,6 +45,14 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
 
+      # 原因同 ci.yml：rust-cache 存缓存前会清掉 target/sherpa-onnx-prebuilt/ 里的静态库，
+      # 只留空目录，下次构建误以为已下载过，链接直接失败。单独缓存这个目录来兜底。
+      - name: Cache sherpa-onnx prebuilt libs
+        uses: actions/cache@v4
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-onnx-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
       - name: Install Frontend Dependencies
         run: npm ci
 

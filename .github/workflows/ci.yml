@@ -47,6 +47,17 @@ jobs:
       - name: Rust Cache
         uses: swatinem/rust-cache@v2
 
+      # sherpa-onnx-sys 的 build.rs 把下载好的静态库解到 target/sherpa-onnx-prebuilt/，
+      # 这个目录不归 Cargo 管，rust-cache 存缓存前的清理会把里面的 .a/.lib 当垃圾扫掉，
+      # 只留空目录——下次构建看到目录存在就当已经下载过，链接时就找不到库了。
+      # 单独给这个目录上缓存：declare 在 rust-cache 之后，靠 post-step 反序执行，
+      # 保证这里的 save 在 rust-cache 的清理之前跑，存下来的是完整文件。
+      - name: Cache sherpa-onnx prebuilt libs
+        uses: actions/cache@v4
+        with:
+          path: target/sherpa-onnx-prebuilt
+          key: sherpa-onnx-prebuilt-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock') }}
+
       - name: Install Linux Dependencies
         if: runner.os == 'Linux'
         run: |
