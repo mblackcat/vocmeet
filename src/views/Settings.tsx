@@ -44,8 +44,15 @@ function isLocalEndpoint(url: string): boolean {
   }
 }
 
+type ProviderId = "ollama" | "openai" | "anthropic" | "gemini";
+/**
+ * chat、chat_compat 都走 /chat/completions，差别只在给中转用的说明。
+ * responses 走 /responses。
+ */
+type ApiFormat = "chat" | "chat_compat" | "responses";
+
 interface ProviderPreset {
-  id: string;
+  id: ProviderId;
   name: string;
   desc: string;
   apiBase: string;
@@ -55,6 +62,8 @@ interface ProviderPreset {
   requiresKey: boolean;
   keyHint: string;
   egressPolicy: "local_only" | "open";
+  /** OpenAI 额外可选接口格式。 */
+  formats?: { id: ApiFormat; name: string; desc: string }[];
 }
 
 const PROVIDER_PRESETS: ProviderPreset[] = [
@@ -71,42 +80,61 @@ const PROVIDER_PRESETS: ProviderPreset[] = [
     egressPolicy: "local_only",
   },
   {
+    id: "openai",
+    name: "OpenAI",
+    desc: "官方接口，也可改成中转地址",
+    apiBase: "https://api.openai.com/v1",
+    defaultModel: "gpt-5.6-sol",
+    candidateModels: ["gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-6-astra"],
+    contextTokens: 65536,
+    requiresKey: true,
+    keyHint: "填入 OpenAI 或中转网关的 Bearer Token",
+    egressPolicy: "open",
+    formats: [
+      { id: "chat", name: "Chat 格式", desc: "官方 /chat/completions" },
+      { id: "chat_compat", name: "Chat 兼容格式", desc: "同样走 /chat/completions，给只实现了 Chat 的中转" },
+      { id: "responses", name: "Responses 格式", desc: "官方 /responses" },
+    ],
+  },
+  {
+    id: "anthropic",
+    name: "Anthropic",
+    desc: "Claude，走 OpenAI 兼容接口",
+    apiBase: "https://api.anthropic.com/v1",
+    defaultModel: "claude-opus-5",
+    candidateModels: ["claude-opus-5", "claude-sonnet-5", "claude-opus-4-8", "claude-fable-5"],
+    contextTokens: 65536,
+    requiresKey: true,
+    keyHint: "在 Anthropic Console 获取 API Key",
+    egressPolicy: "open",
+  },
+  {
     id: "gemini",
     name: "Google Gemini",
-    desc: "官方 OpenAI 兼容接口，百万上下文，极速稳定",
-    apiBase: "https://generativelanguage.googleapis.com/v1beta/openai",
-    defaultModel: "gemini-2.0-flash",
-    candidateModels: ["gemini-2.0-flash", "gemini-1.5-flash", "gemini-1.5-pro"],
+    desc: "Gemini 原生接口，地址一般到 /v1beta",
+    apiBase: "https://generativelanguage.googleapis.com/v1beta",
+    defaultModel: "gemini-3.8-flash",
+    candidateModels: ["gemini-3.8-flash"],
     contextTokens: 65536,
     requiresKey: true,
     keyHint: "请在 Google AI Studio 获取 API Key (AIzaSy...)",
     egressPolicy: "open",
   },
-  {
-    id: "deepseek",
-    name: "DeepSeek",
-    desc: "深度求索官方开放平台，高性价比",
-    apiBase: "https://api.deepseek.com/v1",
-    defaultModel: "deepseek-chat",
-    candidateModels: ["deepseek-chat"],
-    contextTokens: 65536,
-    requiresKey: true,
-    keyHint: "在 DeepSeek 开放平台控制台获取 API Key",
-    egressPolicy: "open",
-  },
-  {
-    id: "openai",
-    name: "OpenAI / 中转",
-    desc: "标准 OpenAI 兼容服务",
-    apiBase: "https://api.openai.com/v1",
-    defaultModel: "gpt-4o-mini",
-    candidateModels: ["gpt-4o-mini", "gpt-4o"],
-    contextTokens: 32768,
-    requiresKey: true,
-    keyHint: "填入 OpenAI 或中转网关的 Bearer Token",
-    egressPolicy: "open",
-  },
 ];
+
+/** 旧配置没有 provider 字段，按地址猜一次。猜不到就当地址是手改过的，不选中任何一家。 */
+function inferProvider(cfg: AppConfig): ProviderId | null {
+  const saved = cfg.llm.provider;
+  if (saved === "ollama" || saved === "openai" || saved === "anthropic" || saved === "gemini") {
+    return saved;
+  }
+  const base = cfg.llm.api_base;
+  if (isLocalEndpoint(base)) return "ollama";
+  if (base.includes("anthropic.com")) return "anthropic";
+  if (base.includes("googleapis.com")) return "gemini";
+  if (base.includes("openai.com")) return "openai";
+  return null;
+}
 
 const GAME_INDUSTRY_TERMS = [
   "ASR", "NPC", "PVP", "PVE", "DAU", "MAU", "MMORPG", "GaaS", "UE5", "Unity",
@@ -241,25 +269,22 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
         onError(asMessage(e));
       }
       try {
-        const [r, d, mp] = await Promise.all([
+        const [r, d, mp, sug] = await Promise.all([
           api.doctor(),
           api.listDevices().catch(() => [] as DeviceInfo[]),
           api.modelDownloadPlan(),
+          api.suggestedLlmModels(),
         ]);
         setReport(r);
         setDevices(d);
         setPlan(mp);
-      } catch (e) {
-        onError(asMessage(e));
-      }
-      try {
-        const [d, sug] = await Promise.all([api.diagnoseLlm(), api.suggestedLlmModels()]);
-        setLlm(d);
         setSuggested(sug);
       } catch (e) {
         onError(asMessage(e));
       }
       void loadArchived();
+      // 端点体检要连网，不挡设置页先出来。
+      void api.diagnoseLlm().then(setLlm).catch(() => {});
     })();
   }, [onError]);
 
@@ -396,13 +421,20 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
       egress_policy: p.egressPolicy,
       llm: {
         ...cfg.llm,
+        provider: p.id,
+        api_format: p.id === "openai" ? cfg.llm.api_format || "chat" : p.id === "gemini" ? "gemini" : "chat",
         api_base: p.apiBase,
         model: p.defaultModel,
         context_tokens: p.contextTokens,
       },
     };
     await persist(next);
-    setMsg(`已切换为「${p.name}」配置模板`);
+    setMsg(`已切换为「${p.name}」。服务地址和模型都可以再改，不会取消选中。`);
+  };
+
+  const setApiFormat = (format: ApiFormat) => {
+    const next: AppConfig = { ...cfg, llm: { ...cfg.llm, api_format: format } };
+    void persist(next);
   };
 
   const addTerm = (term: string) => {
@@ -432,9 +464,9 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
   // 设置页面的快速导航项
   const settingsNavItems = [
     { id: "set-rec-asr", label: "录音与识别" },
-    { id: "set-transcripts", label: "逐字稿的来去" },
-    { id: "set-llm", label: "写纪要的模型" },
-    { id: "set-machine", label: "本机情况" },
+    { id: "set-transcripts", label: "逐字稿存档" },
+    { id: "set-llm", label: "会议总结LLM" },
+    { id: "set-machine", label: "会议本地存档" },
   ];
 
   return (
@@ -444,54 +476,56 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
           <h2>设置</h2>
         </div>
 
-        <div className="check" style={{ marginBottom: 14 }}>
-          <span className="d" style={{ flex: 1 }}>
-            当前版本 v{appVersion || "…"}
+        <div className="check update-row" style={{ marginBottom: 14 }}>
+          <span className="d">当前版本 v{appVersion || "…"}</span>
+          <span className="update-aside">
             {updateCheck?.available && (
-              <div className="note">
+              <span className="note update-tip">
                 发现新版本 v{updateCheck.latest_version}
                 {updateProgress && updateProgress.total && updateProgress.total > 0 && (
-                  <div className="thin-bar" style={{ width: "100%", marginTop: 6 }}>
-                    <div
+                  <span className="thin-bar update-bar">
+                    <span
                       className="fill"
                       style={{
                         width: `${Math.min(100, Math.round((updateProgress.received / updateProgress.total) * 100))}%`,
                       }}
                     />
-                  </div>
+                  </span>
                 )}
-              </div>
+              </span>
             )}
             {updateCheck && !updateCheck.available && updateCheck.newer_version_exists && (
-              <div className="note">发现新版本 v{updateCheck.latest_version}，但没有适配当前系统的安装包</div>
+              <span className="note update-tip">
+                发现新版本 v{updateCheck.latest_version}，但没有适配当前系统的安装包
+              </span>
             )}
-          </span>
-          {updateCheck?.available ? (
-            <div style={{ display: "flex", gap: 8 }}>
-              {installingUpdate && (
-                <button type="button" className="act" onClick={handleCancelInstallUpdate}>
-                  取消
+            {updateCheck?.available ? (
+              <span className="update-actions">
+                {installingUpdate && (
+                  <button type="button" className="act" onClick={handleCancelInstallUpdate}>
+                    取消
+                  </button>
+                )}
+                <button
+                  type="button"
+                  className="act"
+                  disabled={installingUpdate}
+                  onClick={() => void handleInstallUpdate()}
+                >
+                  {installingUpdate ? "安装中…" : "安装更新"}
                 </button>
-              )}
+              </span>
+            ) : (
               <button
                 type="button"
                 className="act"
-                disabled={installingUpdate}
-                onClick={() => void handleInstallUpdate()}
+                disabled={checkingUpdate}
+                onClick={() => void handleCheckUpdate()}
               >
-                {installingUpdate ? "安装中…" : "安装更新"}
+                {checkingUpdate ? "检查中…" : "检查更新"}
               </button>
-            </div>
-          ) : (
-            <button
-              type="button"
-              className="act"
-              disabled={checkingUpdate}
-              onClick={() => void handleCheckUpdate()}
-            >
-              {checkingUpdate ? "检查中…" : "检查更新"}
-            </button>
-          )}
+            )}
+          </span>
         </div>
 
         {msg && <div className="msg">{msg}</div>}
@@ -562,7 +596,6 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
             </>
           )}
 
-          {/* 录音装置字段与提示（从本机情况挪过来） */}
           <div className="subsection-title" style={{ marginTop: 24 }}>录音装置</div>
           {report && (
             <div className="check">
@@ -633,11 +666,6 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
                 />
                 <span className="c-t">开会过程中就逐段转成文字</span>
               </label>
-              <div className="note">
-                把识别的大头（VAD 与 ASR，约占整体耗时三分之二）摊到会议过程中，
-                会后只剩说话人分离和标点，整理明显更快。代价是录制时会占用 CPU——
-                低配机器上如果影响到录音，关掉即可回到「录完再整理」。
-              </div>
             </span>
           </div>
           <div className="set-row">
@@ -659,16 +687,15 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
               />
               <div className="note">
                 每攒够这么多秒就转写一次，也就是文字出现的延迟。
-                只影响内存里的处理节奏，<strong>不改变录音落盘方式</strong>，录音文件仍然完整。
               </div>
             </span>
           </div>
         </div>
 
-        {/* 2. 逐字稿的来去（落盘目录修改，移除原有仅本机和任意端点单选项） */}
+        {/* 2. 逐字稿存档（落盘目录修改，移除原有仅本机和任意端点单选项） */}
         <div id="set-transcripts" className="section-block">
           <h2 className="section">
-            <span className="section-title-tag">逐字稿的来去</span>
+            <span className="section-title-tag">逐字稿存档</span>
           </h2>
 
           <div className="set-row">
@@ -707,20 +734,16 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
           </div>
         </div>
 
-        {/* 3. 写纪要的模型（API密钥挪到模型后、就绪提示前，增加预设信息） */}
+        {/* 3. 会议总结LLM（API密钥挪到模型后、就绪提示前，增加预设信息） */}
         <div id="set-llm" className="section-block">
           <h2 className="section">
-            <span className="section-title-tag">写纪要的模型</span>
+            <span className="section-title-tag">会议总结LLM</span>
           </h2>
 
           {/* 预设服务商按钮 */}
           <div style={{ display: "flex", gap: 8, flexWrap: "wrap", margin: "14px 0 16px" }}>
             {PROVIDER_PRESETS.map((p) => {
-              const active =
-                (p.id === "ollama" && isLocalEndpoint(cfg.llm.api_base)) ||
-                (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
-                (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
-                (p.id === "openai" && cfg.llm.api_base.includes("openai.com"));
+              const active = inferProvider(cfg) === p.id;
               return (
                 <button
                   key={p.id}
@@ -740,6 +763,44 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
             })}
           </div>
 
+          {(() => {
+            const current = PROVIDER_PRESETS.find((p) => p.id === inferProvider(cfg));
+            if (!current?.formats) return null;
+            const selected: ApiFormat =
+              cfg.llm.api_format === "responses" || cfg.llm.api_format === "chat_compat"
+                ? cfg.llm.api_format
+                : "chat";
+            return (
+              <div className="set-row">
+                <span className="k">接口格式</span>
+                <span className="v">
+                  <div style={{ display: "flex", gap: 8, flexWrap: "wrap" }}>
+                    {current.formats.map((f) => (
+                      <button
+                        key={f.id}
+                        type="button"
+                        className="act"
+                        title={f.desc}
+                        style={{
+                          padding: "5px 12px",
+                          background: selected === f.id ? "var(--paper-2)" : "none",
+                          borderColor: selected === f.id ? "var(--ink)" : "var(--rule)",
+                        }}
+                        onClick={() => setApiFormat(f.id)}
+                      >
+                        {f.name}
+                      </button>
+                    ))}
+                  </div>
+                  <div className="note">
+                    {current.formats.find((f) => f.id === selected)?.desc}
+                    。服务地址可以改成中转，格式保持不变。
+                  </div>
+                </span>
+              </div>
+            );
+          })()}
+
           {/* 服务地址 */}
           <div className="set-row">
             <span className="k">服务地址</span>
@@ -747,14 +808,16 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
               <input
                 type="text"
                 value={cfg.llm.api_base}
-                placeholder="http://localhost:11434/v1 或 https://api.deepseek.com/v1"
+                placeholder="http://localhost:11434/v1"
                 onChange={(e) => patch({ llm: { ...cfg.llm, api_base: e.target.value } })}
                 onBlur={() => void persist(cfg)}
               />
               <div className="note">
                 {isLocalEndpoint(cfg.llm.api_base)
                   ? "当前为本地端点（Ollama / vLLM / llama.cpp）"
-                  : "当前为远端端点（标准 OpenAI 兼容协议）"}
+                  : inferProvider(cfg) === "gemini"
+                    ? "当前为 Gemini 原生接口，请求发到 /v1beta/models/{模型}:generateContent"
+                    : "当前为远端端点（OpenAI 兼容协议）"}
               </div>
             </span>
           </div>
@@ -777,13 +840,7 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
               </datalist>
 
               {(() => {
-                const currentPreset = PROVIDER_PRESETS.find(
-                  (p) =>
-                    (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
-                    (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
-                    (p.id === "openai" && cfg.llm.api_base.includes("openai.com")) ||
-                    (p.id === "ollama" && isLocalEndpoint(cfg.llm.api_base)),
-                );
+                const currentPreset = PROVIDER_PRESETS.find((p) => p.id === inferProvider(cfg));
                 if (!currentPreset || currentPreset.candidateModels.length === 0) return null;
                 return (
                   <div style={{ display: "flex", gap: 8, marginTop: 6, flexWrap: "wrap", alignItems: "baseline" }}>
@@ -844,13 +901,10 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
               <div className="note">
                 {hasKey ? "凭据管理器已存有密钥。" : "尚未存储密钥。"}
                 {(() => {
-                  const currentPreset = PROVIDER_PRESETS.find(
-                    (p) =>
-                      (p.id === "gemini" && cfg.llm.api_base.includes("googleapis.com")) ||
-                      (p.id === "deepseek" && cfg.llm.api_base.includes("deepseek.com")) ||
-                      (p.id === "openai" && cfg.llm.api_base.includes("openai.com")),
-                  );
-                  return currentPreset ? ` ${currentPreset.keyHint}` : " 远端兼容服务使用 Bearer Token 认证。";
+                  const currentPreset = PROVIDER_PRESETS.find((p) => p.id === inferProvider(cfg));
+                  return currentPreset
+                    ? ` ${currentPreset.keyHint}`
+                    : " 远端兼容服务使用 Bearer Token 认证。";
                 })()}
               </div>
             </span>
@@ -1015,10 +1069,10 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
           </div>
         </div>
 
-        {/* 4. 本机情况 */}
+        {/* 4. 会议本地存档 */}
         <div id="set-machine" className="section-block">
           <h2 className="section">
-            <span className="section-title-tag">本机情况</span>
+            <span className="section-title-tag">会议本地存档</span>
           </h2>
 
           {report && (

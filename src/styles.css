@@ -57,14 +57,83 @@ body {
 
 .shell { display: flex; height: 100%; }
 
-/* 隐藏原生标题栏后的拖拽带。透明、只负责拖窗口，高度取 macOS 标题栏的观感高度。
-   z-index 要压在内容之上，但它上方（y < 28px）本就没有可点的东西。 */
+/* 隐藏原生标题栏后的拖拽带。透明、只负责拖窗口。
+   Mac 让开左上角红绿灯；Windows 右侧留给自绘按钮。 */
 .titlebar-drag {
   position: fixed;
   top: 0; left: 0; right: 0;
   height: 28px;
   z-index: 50;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
 }
+
+/* Windows 自绘窗口按钮。Mac 用系统红绿灯，这组按钮藏起来。 */
+.win-chrome {
+  display: none;
+  position: fixed;
+  top: 0; right: 0;
+  height: 36px;
+  z-index: 60;
+  align-items: stretch;
+  background: var(--paper);
+  border-bottom: 1px solid var(--rule);
+}
+.win-btn {
+  width: 46px;
+  border: 0;
+  background: transparent;
+  color: var(--ink-2);
+  cursor: pointer;
+  display: grid;
+  place-items: center;
+  padding: 0;
+}
+.win-btn:hover { background: var(--paper-2); color: var(--ink); }
+.win-btn-close:hover { background: var(--live); color: var(--paper); }
+
+.close-hint {
+  position: absolute;
+  top: 44px;
+  right: 8px;
+  width: 248px;
+  padding: 14px 16px 12px;
+  background: var(--ink);
+  color: var(--paper);
+  font-size: 13px;
+  line-height: 1.6;
+  font-weight: 300;
+}
+.close-hint::before {
+  content: "";
+  position: absolute;
+  top: -6px;
+  right: 18px;
+  border: 6px solid transparent;
+  border-bottom-color: var(--ink);
+  border-top: 0;
+}
+.close-hint p { margin: 0 0 8px; }
+.close-hint button {
+  margin-top: 4px;
+  border: 1px solid rgba(242, 242, 239, 0.45);
+  background: transparent;
+  color: var(--paper);
+  font-family: inherit;
+  font-weight: 300;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  padding: 4px 12px;
+  cursor: pointer;
+}
+.close-hint button:hover { border-color: var(--paper); }
+
+html.os-windows .win-chrome { display: flex; }
+html.os-windows .titlebar-drag { right: 138px; height: 36px; }
+/* 顶栏是一整条实底，内容从它下面开始。
+   侧栏和主区一起下移，滚动条就不会伸进顶栏。 */
+html.os-windows .shell { padding-top: 36px; }
+html.os-windows .rail { padding-top: 16px; }
 
 .rail {
   width: var(--rail);
@@ -72,8 +141,9 @@ body {
   border-right: 1px solid var(--rule);
   display: flex;
   flex-direction: column;
-  /* 顶部留 52px：红绿灯按钮浮在窗口左上角（约 78×20pt），
-     原来的 28px 会让它们直接压在品牌区的 logo 上。 */
+  /* Mac：顶部留 52px，红绿灯浮在左上角（约 78×20pt），
+     28px 会让它们直接压在品牌区的 logo 上。
+     Windows 没有红绿灯，padding 在下面的平台规则里收回。 */
   padding: 52px 0 0;
 }
 
@@ -164,6 +234,13 @@ body {
 .banner button {
   border: 0; background: none; cursor: pointer;
   color: var(--live); font-size: 17px; line-height: 1; padding: 0 4px;
+}
+.stage-notice {
+  margin: 14px 24px 0;
+  color: var(--signal);
+  border-bottom: 1px solid var(--rule);
+  padding-bottom: 8px;
+  font-size: 13px;
 }
 
 /* 录制现场是一屏应用：整体不滚动，滚动只发生在气泡列表内部。 */
@@ -518,6 +595,19 @@ h2.section {
 .check .st.ok { color: var(--signal); }
 .check .st.no { color: var(--live); }
 .check .d { flex: 1; color: var(--ink-2); }
+
+/* 检查更新的说明贴在按钮左侧，同一行。 */
+.update-row { align-items: center; }
+.update-aside {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  min-width: 0;
+}
+.update-tip { margin-top: 0; text-align: right; }
+.update-actions { display: flex; gap: 8px; flex-shrink: 0; }
+.update-bar { display: block; width: 120px; margin: 6px 0 0 auto; }
 
 .msg { padding: 10px 0; font-size: 13px; border-bottom: 1px solid var(--rule); margin-bottom: 18px; }
 .msg.bad { color: var(--live); }

@@ -66,13 +66,51 @@ impl LlmClient {
         &self.config
     }
 
-    fn endpoint(&self) -> String {
+    /// Gemini 用自己的协议：`/v1beta/models/{model}:generateContent`。
+    /// 选中 Gemini，或地址落在 generativelanguage，都走这条，不走 OpenAI 兼容层。
+    fn is_gemini(&self) -> bool {
+        if matches!(
+            self.config.provider.as_str(),
+            "openai" | "anthropic" | "ollama"
+        ) {
+            return false;
+        }
+        self.config.provider == "gemini"
+            || self.config.api_format == "gemini"
+            || self.config.api_base.contains("generativelanguage.googleapis.com")
+    }
+
+    /// 调用地址。Gemini 走原生方法；`responses` 走 `/responses`；其余走 `/chat/completions`。
+    /// 用户已经把完整路径写进服务地址时，不再追加。
+    fn endpoint(&self, stream: bool) -> String {
         let base = self.config.api_base.trim().trim_end_matches('/');
-        if base.ends_with("/chat/completions") {
-            base.to_string()
+        if self.is_gemini() {
+            let root = gemini_root(base);
+            let model = gemini_model_id(&self.config.model);
+            let method = if stream {
+                "streamGenerateContent"
+            } else {
+                "generateContent"
+            };
+            let mut url = format!("{root}/models/{model}:{method}");
+            if stream {
+                url.push_str("?alt=sse");
+            }
+            return url;
+        }
+        if base.ends_with("/chat/completions") || base.ends_with("/responses") {
+            return base.to_string();
+        }
+        // chat 与 chat_compat 都走 /chat/completions，只有 responses 换路径。
+        if self.config.api_format == "responses" {
+            format!("{base}/responses")
         } else {
             format!("{base}/chat/completions")
         }
+    }
+
+    fn uses_responses(&self) -> bool {
+        !self.is_gemini() && self.endpoint(false).ends_with("/responses")
     }
 
     /// 出网守卫：策略校验 + 生成审计记录。**所有请求都必须先过这里。**
@@ -95,16 +133,76 @@ impl LlmClient {
     }
 
     fn build_body(&self, messages: &[ChatMessage], stream: bool) -> serde_json::Value {
-        serde_json::json!({
-            "model": self.config.model,
-            "messages": messages.iter().map(|m| serde_json::json!({
-                "role": m.role,
-                "content": m.content,
-            })).collect::<Vec<_>>(),
-            "temperature": self.config.temperature,
-            "max_tokens": self.config.max_tokens,
-            "stream": stream,
-        })
+        if self.is_gemini() {
+            let system = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let contents: Vec<_> = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .map(|m| {
+                    serde_json::json!({
+                        "role": if m.role == "assistant" { "model" } else { "user" },
+                        "parts": [{ "text": m.content }],
+                    })
+                })
+                .collect();
+            let mut body = serde_json::json!({
+                "contents": contents,
+                "generationConfig": {
+                    "temperature": self.config.temperature,
+                    "maxOutputTokens": self.config.max_tokens,
+                }
+            });
+            if !system.is_empty() {
+                body["systemInstruction"] =
+                    serde_json::json!({ "parts": [{ "text": system }] });
+            }
+            let _ = stream;
+            body
+        } else if self.uses_responses() {
+            let instructions = messages
+                .iter()
+                .filter(|m| m.role == "system")
+                .map(|m| m.content.as_str())
+                .collect::<Vec<_>>()
+                .join("\n\n");
+            let input: Vec<_> = messages
+                .iter()
+                .filter(|m| m.role != "system")
+                .map(|m| {
+                    serde_json::json!({
+                        "role": m.role,
+                        "content": m.content,
+                    })
+                })
+                .collect();
+            let mut body = serde_json::json!({
+                "model": self.config.model,
+                "input": input,
+                "temperature": self.config.temperature,
+                "max_output_tokens": self.config.max_tokens,
+                "stream": stream,
+            });
+            if !instructions.is_empty() {
+                body["instructions"] = serde_json::Value::String(instructions);
+            }
+            body
+        } else {
+            serde_json::json!({
+                "model": self.config.model,
+                "messages": messages.iter().map(|m| serde_json::json!({
+                    "role": m.role,
+                    "content": m.content,
+                })).collect::<Vec<_>>(),
+                "temperature": self.config.temperature,
+                "max_tokens": self.config.max_tokens,
+                "stream": stream,
+            })
+        }
     }
 
     fn apply_headers(&self, req: reqwest::RequestBuilder, sse: bool) -> reqwest::RequestBuilder {
@@ -113,7 +211,11 @@ impl LlmClient {
             req = req.header("Accept", "text/event-stream");
         }
         if let Some(key) = &self.api_key {
-            req = req.header("Authorization", format!("Bearer {key}"));
+            if self.is_gemini() {
+                req = req.header("x-goog-api-key", key);
+            } else {
+                req = req.header("Authorization", format!("Bearer {key}"));
+            }
         }
         req
     }
@@ -135,7 +237,7 @@ impl LlmClient {
             }
 
             match self
-                .apply_headers(self.http.post(self.endpoint()), false)
+                .apply_headers(self.http.post(self.endpoint(false)), false)
                 .json(&body)
                 .send()
                 .await
@@ -147,13 +249,10 @@ impl LlmClient {
                             .json()
                             .await
                             .map_err(|e| Error::Llm(format!("解析响应失败: {e}")))?;
-                        let text = json["choices"]
-                            .get(0)
-                            .and_then(|c| c["message"]["content"].as_str())
-                            .ok_or_else(|| {
-                                Error::Llm(format!("响应缺少 choices[0].message.content: {json}"))
-                            })?;
-                        return Ok((text.to_string(), record));
+                        let text = extract_completion_text(&json).ok_or_else(|| {
+                            Error::Llm(format!("响应里没有文本：{json}"))
+                        })?;
+                        return Ok((text, record));
                     }
 
                     // 先读 body 再抛错——只有状态码的日志排障成本极高。
@@ -182,7 +281,7 @@ impl LlmClient {
         let body = self.build_body(messages, true);
 
         let resp = self
-            .apply_headers(self.http.post(self.endpoint()), true)
+            .apply_headers(self.http.post(self.endpoint(true)), true)
             .json(&body)
             .send()
             .await
@@ -207,7 +306,7 @@ impl LlmClient {
             for event in parser.push(&bytes) {
                 match event {
                     SseEvent::Done => return Ok((full, record)),
-                    SseEvent::Data(payload) => match extract_delta(&payload) {
+                    SseEvent::Data(payload) => match extract_stream_delta(&payload) {
                         Ok(Some(delta)) => {
                             consecutive_errors = 0;
                             on_delta(&delta);
@@ -239,12 +338,14 @@ impl LlmClient {
     /// 打错模型名会得到一个 404，而 404 长得跟「服务没起来」很像，很难排查。
     pub async fn list_models(&self) -> Result<Vec<String>> {
         policy::check_endpoint(self.policy, &self.config.api_base)?;
+        if self.is_gemini() {
+            return self.list_gemini_models().await;
+        }
         let base = self.config.api_base.trim().trim_end_matches('/');
-        let base = if let Some(stripped) = base.strip_suffix("/chat/completions") {
-            stripped
-        } else {
-            base
-        };
+        let base = base
+            .strip_suffix("/chat/completions")
+            .or_else(|| base.strip_suffix("/responses"))
+            .unwrap_or(base);
         let url = format!("{base}/models");
         let resp = self
             .apply_headers(self.http.get(&url), false)
@@ -272,6 +373,36 @@ impl LlmClient {
         Ok(names)
     }
 
+    /// Gemini 的模型清单：`GET {root}/models`，名字在 `models[].name`，形如 `models/gemini-3.8-flash`。
+    async fn list_gemini_models(&self) -> Result<Vec<String>> {
+        let root = gemini_root(self.config.api_base.trim().trim_end_matches('/'));
+        let url = format!("{root}/models");
+        let resp = self
+            .apply_headers(self.http.get(&url), false)
+            .send()
+            .await
+            .map_err(|e| Error::Llm(format!("连接 {url} 失败：{e}")))?;
+        if !resp.status().is_success() {
+            return Err(Error::Llm(format!("{url} 返回 HTTP {}", resp.status())));
+        }
+        let json: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| Error::Llm(format!("解析模型列表失败：{e}")))?;
+        let mut names: Vec<String> = json
+            .get("models")
+            .and_then(|d| d.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|m| m.get("name").and_then(|n| n.as_str()))
+                    .map(|s| s.strip_prefix("models/").unwrap_or(s).to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        names.sort();
+        Ok(names)
+    }
+
 
     /// Ollama 的根地址：把 OpenAI 兼容前缀 `/v1` 去掉。
     ///
@@ -283,7 +414,7 @@ impl LlmClient {
 
     /// 让端点自己去拉一个模型（仅 Ollama）。
     ///
-    /// 这是「一键配置」的最后一环：识别模型能一键下，写纪要的模型不能的话，
+    /// 这是「一键配置」的最后一环：识别模型能一键下，会议总结LLM不能的话，
     /// 用户还是得去开命令行。不是 Ollama 的端点会返回 404，照实说就行。
     pub async fn pull_model(
         &self,
@@ -558,11 +689,103 @@ fn truncate(s: &str, max: usize) -> String {
     s.chars().take(max).collect::<String>() + "…"
 }
 
+/// 非流式响应里的正文。Chat 取 `choices[0].message.content`，
+/// Responses 取 `output_text`，没有就从 `output[].content[]` 拼。
+fn extract_completion_text(json: &serde_json::Value) -> Option<String> {
+    if json.get("candidates").is_some() {
+        return gemini_text(json);
+    }
+    if let Some(text) = json.get("output_text").and_then(|t| t.as_str()) {
+        if !text.is_empty() {
+            return Some(text.to_string());
+        }
+    }
+    if let Some(parts) = json.get("output").and_then(|o| o.as_array()) {
+        let mut buf = String::new();
+        for part in parts {
+            let Some(contents) = part.get("content").and_then(|c| c.as_array()) else {
+                continue;
+            };
+            for content in contents {
+                if let Some(text) = content.get("text").and_then(|t| t.as_str()) {
+                    buf.push_str(text);
+                }
+            }
+        }
+        if !buf.is_empty() {
+            return Some(buf);
+        }
+    }
+    json.get("choices")
+        .and_then(|c| c.get(0))
+        .and_then(|c| c.get("message"))
+        .and_then(|m| m.get("content"))
+        .and_then(|c| c.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+/// Gemini 正文在 `candidates[0].content.parts[].text`。
+fn gemini_text(json: &serde_json::Value) -> Option<String> {
+    let parts = json
+        .get("candidates")?
+        .get(0)?
+        .get("content")?
+        .get("parts")?
+        .as_array()?;
+    let mut buf = String::new();
+    for part in parts {
+        if let Some(text) = part.get("text").and_then(|t| t.as_str()) {
+            buf.push_str(text);
+        }
+    }
+    if buf.is_empty() { None } else { Some(buf) }
+}
+
+/// 服务地址收成 Gemini 的 API 根。`.../v1beta`、`.../v1beta/openai`、
+/// 甚至已经写到方法路径，都归一到 `https://host/v1beta`。
+fn gemini_root(base: &str) -> String {
+    let base = base.trim_end_matches('/');
+    if let Some(i) = base.find("/v1beta") {
+        base[..=i + "/v1beta".len() - 1].to_string()
+    } else {
+        format!("{base}/v1beta")
+    }
+}
+
+fn gemini_model_id(model: &str) -> String {
+    let model = model.trim().trim_matches('/');
+    model
+        .strip_prefix("models/")
+        .unwrap_or(model)
+        .to_string()
+}
+
 /// 从一个 SSE data payload 里取出增量文本。
 ///
-/// `Ok(None)` 表示合法但无内容的 chunk（role chunk、usage-only chunk）。
-fn extract_delta(payload: &str) -> std::result::Result<Option<String>, serde_json::Error> {
+/// Chat 读 `choices[0].delta.content`，Responses 读 `delta`（文本事件）
+/// 或 `response.output_text.delta`。`Ok(None)` 表示合法但无内容的事件。
+fn extract_stream_delta(payload: &str) -> std::result::Result<Option<String>, serde_json::Error> {
     let json: serde_json::Value = serde_json::from_str(payload)?;
+    if json.get("candidates").is_some() {
+        return Ok(gemini_text(&json));
+    }
+    if let Some(kind) = json.get("type").and_then(|t| t.as_str()) {
+        if kind == "response.output_text.delta" {
+            return Ok(json
+                .get("delta")
+                .and_then(|d| d.as_str())
+                .filter(|s| !s.is_empty())
+                .map(str::to_string));
+        }
+        if kind.starts_with("response.") {
+            return Ok(None);
+        }
+    }
+    extract_delta(&json)
+}
+
+fn extract_delta(json: &serde_json::Value) -> std::result::Result<Option<String>, serde_json::Error> {
     let Some(choices) = json.get("choices").and_then(|c| c.as_array()) else {
         return Ok(None);
     };
@@ -677,25 +900,46 @@ mod tests {
     #[test]
     fn empty_choices_array_is_not_an_error() {
         // 真实网关的 usage-only chunk
-        let out = extract_delta(r#"{"choices":[],"usage":{"total_tokens":10}}"#).unwrap();
+        let out = extract_stream_delta(r#"{"choices":[],"usage":{"total_tokens":10}}"#).unwrap();
         assert_eq!(out, None, "空 choices 必须跳过而不是 panic");
     }
 
     #[test]
     fn role_chunk_yields_no_delta() {
-        let out = extract_delta(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).unwrap();
+        let out =
+            extract_stream_delta(r#"{"choices":[{"delta":{"role":"assistant"}}]}"#).unwrap();
         assert_eq!(out, None);
     }
 
     #[test]
     fn content_delta_is_extracted() {
-        let out = extract_delta(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).unwrap();
+        let out = extract_stream_delta(r#"{"choices":[{"delta":{"content":"你好"}}]}"#).unwrap();
         assert_eq!(out.as_deref(), Some("你好"));
     }
 
     #[test]
+    fn responses_delta_is_extracted() {
+        let out = extract_stream_delta(
+            r#"{"type":"response.output_text.delta","delta":"你好"}"#,
+        )
+        .unwrap();
+        assert_eq!(out.as_deref(), Some("你好"));
+        let skip = extract_stream_delta(r#"{"type":"response.completed"}"#).unwrap();
+        assert_eq!(skip, None);
+    }
+
+    #[test]
+    fn responses_completion_text() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"output_text":"纪要","output":[{"content":[{"text":"ignored"}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_completion_text(&json).as_deref(), Some("纪要"));
+    }
+
+    #[test]
     fn malformed_json_is_an_error() {
-        assert!(extract_delta("not json").is_err());
+        assert!(extract_stream_delta("not json").is_err());
     }
 
     #[test]
@@ -726,19 +970,70 @@ mod tests {
         let cases = [
             ("http://localhost:11434/v1", "http://localhost:11434/v1/chat/completions"),
             ("http://localhost:11434/v1/", "http://localhost:11434/v1/chat/completions"),
-            ("https://generativelanguage.googleapis.com/v1beta/openai", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"),
-            ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"),
-            ("https://generativelanguage.googleapis.com/v1beta/openai/chat/completions/", "https://generativelanguage.googleapis.com/v1beta/openai/chat/completions"),
+            ("https://api.openai.com/v1/responses", "https://api.openai.com/v1/responses"),
         ];
 
         for (input, expected) in cases {
             let cfg = LlmConfig {
                 api_base: input.into(),
+                api_format: if input.ends_with("/responses") {
+                    "responses".into()
+                } else {
+                    "chat".into()
+                },
                 ..LlmConfig::default()
             };
             let client = LlmClient::new(cfg, EgressPolicy::Open, None).unwrap();
-            assert_eq!(client.endpoint(), expected, "failed for input: {input}");
+            assert_eq!(client.endpoint(false), expected, "failed for input: {input}");
         }
+    }
+
+    #[test]
+    fn gemini_uses_native_generate_content() {
+        let cases = [
+            "https://generativelanguage.googleapis.com/v1beta",
+            "https://generativelanguage.googleapis.com/v1beta/openai",
+            "https://generativelanguage.googleapis.com",
+        ];
+        for input in cases {
+            let cfg = LlmConfig {
+                api_base: input.into(),
+                provider: "gemini".into(),
+                model: "gemini-3.8-flash".into(),
+                ..LlmConfig::default()
+            };
+            let client = LlmClient::new(cfg, EgressPolicy::Open, Some("k".into())).unwrap();
+            assert_eq!(
+                client.endpoint(false),
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-3.8-flash:generateContent"
+            );
+            assert!(client.endpoint(true).contains(":streamGenerateContent?alt=sse"));
+        }
+        let body = {
+            let cfg = LlmConfig {
+                provider: "gemini".into(),
+                model: "gemini-3.8-flash".into(),
+                ..LlmConfig::default()
+            };
+            let client = LlmClient::new(cfg, EgressPolicy::Open, None).unwrap();
+            client.build_body(
+                &[ChatMessage::system("规则"), ChatMessage::user("你好")],
+                false,
+            )
+        };
+        assert_eq!(body["contents"][0]["role"], "user");
+        assert_eq!(body["contents"][0]["parts"][0]["text"], "你好");
+        assert_eq!(body["systemInstruction"]["parts"][0]["text"], "规则");
+        assert!(body.get("messages").is_none());
+    }
+
+    #[test]
+    fn gemini_text_comes_from_candidates() {
+        let json: serde_json::Value = serde_json::from_str(
+            r#"{"candidates":[{"content":{"parts":[{"text":"纪要"}]}}]}"#,
+        )
+        .unwrap();
+        assert_eq!(extract_completion_text(&json).as_deref(), Some("纪要"));
     }
 
     #[test]

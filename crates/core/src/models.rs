@@ -52,7 +52,7 @@ impl ModelSet {
         }
     }
 
-    fn entries(&self) -> Vec<(&'static str, &Path)> {
+    pub fn entries(&self) -> Vec<(&'static str, &Path)> {
         vec![
             ("asr_model", &self.asr_model),
             ("asr_tokens", &self.asr_tokens),

@@ -36,6 +36,16 @@ pub struct Config {
 pub struct LlmConfig {
     /// OpenAI 兼容端点，形如 `http://localhost:11434/v1`。
     pub api_base: String,
+    /// 上次在设置里点选的服务商：ollama / openai / anthropic / gemini。
+    ///
+    /// 选中态认这个字段，不认地址字符串。地址可以手改（中转、自建网关），
+    /// 改完不该把选中的服务商取消掉。旧配置没有这个字段，按地址猜一次。
+    #[serde(default)]
+    pub provider: String,
+    /// 请求体格式。`chat` 走 `/chat/completions`，`responses` 走 `/responses`。
+    /// 空字符串按 chat 处理，兼容旧配置。
+    #[serde(default)]
+    pub api_format: String,
     pub model: String,
     /// 上下文窗口（token）。决定 map-reduce 的 chunk 大小，见 §4.4。
     pub context_tokens: usize,
@@ -52,6 +62,8 @@ impl Default for LlmConfig {
         Self {
             // 默认指向本地 Ollama——与 LocalOnly 策略自洽，开箱不出网。
             api_base: "http://localhost:11434/v1".to_string(),
+            provider: "ollama".to_string(),
+            api_format: "chat".to_string(),
             model: "qwen2.5:7b".to_string(),
             context_tokens: 8192,
             temperature: 0.2,

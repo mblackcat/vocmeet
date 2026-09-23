@@ -15,6 +15,8 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 use tauri::{AppHandle, Emitter, Manager, State};
+#[cfg(windows)]
+use tauri::WindowEvent;
 
 use vocmeet_core::asr::{
     CancelToken, Progress, SherpaEngine, Stage, TranscribeJob, TranscriptionEngine,
@@ -145,20 +147,20 @@ fn doctor(state: State<AppState>) -> R<DoctorReport> {
     let cfg = state.config()?;
     let models = ModelSet::from_root(&cfg.models_dir);
 
+    // 只看文件在不在、占多大。整包 SHA256 要读几百 MB，设置页每次打开都算一遍会卡住。
     let (models_ok, models_message, model_files, total_mb) = match models.verify_present() {
         Ok(()) => {
+            let total = models.total_size().unwrap_or(0);
             let files = models
-                .checksums()
-                .map_err(err)?
+                .entries()
                 .into_iter()
-                .map(|(name, digest, size)| ModelFile {
-                    name,
-                    size_mb: size as f64 / 1e6,
-                    sha256_prefix: digest[..16].to_string(),
+                .map(|(name, path)| ModelFile {
+                    name: name.to_string(),
+                    size_mb: std::fs::metadata(path).map(|m| m.len()).unwrap_or(0) as f64 / 1e6,
+                    sha256_prefix: String::new(),
                 })
                 .collect::<Vec<_>>();
-            let total = models.total_size().unwrap_or(0) as f64 / 1e6;
-            (true, "全部权重就位".to_string(), files, total)
+            (true, "全部权重就位".to_string(), files, total as f64 / 1e6)
         }
         Err(e) => (
             false,
@@ -1222,7 +1224,7 @@ fn pull_llm_model(app: AppHandle, state: State<AppState>, model: String) -> R<()
                         let _ = guard.save(&state.config_path);
                     }
                 }
-                format!("{model} 已就位，写纪要的模型已切到它")
+                format!("{model} 已就位，会议总结LLM已切到它")
             }
             Err(e) => e.clone(),
         };
@@ -2083,6 +2085,55 @@ const TRAY_ID: &str = "vocmeet-status";
 const TRAY_IDLE_PNG: &[u8] = include_bytes!("../icons/tray-idle.png");
 const TRAY_RECORDING_PNG: &[u8] = include_bytes!("../icons/tray-recording.png");
 
+/// 第一次点关闭时提醒「不会直接退出」。记在数据目录里，不进配置文件——
+/// 这只是一次提示，不该出现在用户能改的设置里。
+#[cfg(windows)]
+fn close_hint_flag_path() -> PathBuf {
+    vocmeet_core::config::default_config_path()
+        .parent()
+        .map(|d| d.join("close-hint.seen"))
+        .unwrap_or_else(|| PathBuf::from("close-hint.seen"))
+}
+
+/// 无边框窗口上，Tauri 自己记的「已最大化」会和系统实际状态错开：
+/// 双击标题栏最大化之后，再双击它仍认为没最大化，于是又最大化一次，还原不了。
+/// 这里按系统的 `IsZoomed` 判断，已经铺满就还原。
+#[cfg(windows)]
+#[tauri::command]
+fn toggle_maximize(window: tauri::WebviewWindow) {
+    let zoomed = window
+        .hwnd()
+        .ok()
+        .map(|hwnd| {
+            use windows::Win32::Foundation::HWND;
+            unsafe { windows::Win32::UI::WindowsAndMessaging::IsZoomed(HWND(hwnd.0)).as_bool() }
+        })
+        .unwrap_or(false);
+    if zoomed {
+        let _ = window.unmaximize();
+    } else {
+        let _ = window.maximize();
+    }
+}
+
+/// 点关闭：收到托盘，不退出。
+///
+/// 第一次先不收，让界面在关闭按钮旁把这件事说清楚；
+/// 再点一次才真正收起。更新安装走 `app.exit`，不经过这里。
+#[cfg(windows)]
+fn hide_to_tray(window: &tauri::Window) {
+    let seen = close_hint_flag_path().is_file();
+    if !seen {
+        if let Some(dir) = close_hint_flag_path().parent() {
+            let _ = std::fs::create_dir_all(dir);
+        }
+        let _ = std::fs::write(close_hint_flag_path(), b"1");
+        let _ = window.emit("close-to-tray-hint", ());
+        return;
+    }
+    let _ = window.hide();
+}
+
 /// 菜单栏常驻图标。空闲时是单色 template 图标（自动适配深浅色菜单栏），
 /// 录制时换成砖红实心——窗口不在前台也能一眼看到还在录。
 fn build_tray(app: &AppHandle) -> tauri::Result<()> {
@@ -2422,7 +2473,25 @@ fn main() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .on_window_event(|window, event| {
+            // 只改 Windows。Mac 的关闭仍走系统红绿灯。
+            #[cfg(windows)]
+            if let WindowEvent::CloseRequested { api, .. } = event {
+                api.prevent_close();
+                hide_to_tray(window);
+            }
+            #[cfg(not(windows))]
+            let _ = (window, event);
+        })
         .setup(move |app| {
+            // titleBarStyle 只在 macOS 去掉标题栏。Windows 得自己摘掉装饰，
+            // 否则系统标题「VocMeet」会和侧栏里的标题叠在一起。
+            // 运行时摘，而不是写进配置：配置是全平台的，Mac 还要留着红绿灯。
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window("main") {
+                let _ = window.set_decorations(false);
+                let _ = window.set_shadow(true);
+            }
             // 提示词模板随安装包走。原来指的是相对路径 "templates"，
             // 装完之后同样解析不到——纪要会在「读模板」这一步失败。
             if !templates_dir.join("meeting_default.yaml").is_file() {
@@ -2514,6 +2583,8 @@ fn main() {
             check_update,
             install_update,
             cancel_update_install,
+            #[cfg(windows)]
+            toggle_maximize,
         ])
         .run(tauri::generate_context!())
         .expect("启动 VocMeet 失败");

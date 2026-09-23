@@ -12,7 +12,7 @@
   "app": {
     "windows": [
       {
-        "title": "VocMeet 声会",
+        "title": "VocMeet",
         "width": 1280,
         "height": 860,
         "minWidth": 960,
