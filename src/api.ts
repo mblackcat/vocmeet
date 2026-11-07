@@ -164,6 +164,9 @@ export const events = {
     listen<UpdateProgressEvent>("update-download-progress", (e) => cb(e.payload)),
   onUpdateInstallDone: (cb: (e: UpdateDoneEvent) => void): Promise<UnlistenFn> =>
     listen<UpdateDoneEvent>("update-install-done", (e) => cb(e.payload)),
+  /** 第一次点关闭：窗口已收到托盘，界面要补一句说明。 */
+  onCloseToTrayHint: (cb: () => void): Promise<UnlistenFn> =>
+    listen("close-to-tray-hint", () => cb()),
 };
 
 /** Tauri command 的错误是字符串，统一成消息文本方便 UI 处理。 */

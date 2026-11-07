@@ -108,7 +108,7 @@ impl ModelSet {
         }
     }
 
-    fn entries(&self) -> Vec<(&'static str, &Path)> {
+    pub fn entries(&self) -> Vec<(&'static str, &Path)> {
         let mut out = vec![("asr_model", self.asr_model.as_path())];
         if let Some(d) = &self.asr_decoder {
             out.push(("asr_decoder", d.as_path()));

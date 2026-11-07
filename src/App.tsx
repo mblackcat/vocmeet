@@ -10,6 +10,7 @@ import MeetingView from "./views/MeetingView";
 import Settings from "./views/Settings";
 import MeetingContextMenu from "./MeetingContextMenu";
 import ParticipantModal from "./components/ParticipantModal";
+import WindowChrome from "./components/WindowChrome";
 
 const PAGE = 20;
 
@@ -40,6 +41,22 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [menu, setMenu] = useState<{ x: number; y: number; meeting: Meeting } | null>(null);
+  /** 第一次点关闭时，在关闭按钮旁说明「收到托盘，不会退出」。 */
+  const [closeHint, setCloseHint] = useState(false);
+
+  useEffect(() => {
+    if (navigator.userAgent.includes("Windows")) {
+      document.documentElement.classList.add("os-windows");
+    }
+  }, []);
+
+  useEffect(() => {
+    let unlisten: UnlistenFn | undefined;
+    events.onCloseToTrayHint(() => setCloseHint(true)).then((fn) => {
+      unlisten = fn;
+    });
+    return () => unlisten?.();
+  }, []);
 
   // 全局屏蔽系统/WebView 默认自带的右键菜单
   useEffect(() => {
@@ -311,10 +328,9 @@ export default function App() {
 
   return (
     <div className="shell">
-      {/* 原生标题栏已隐藏（titleBarStyle: Overlay），窗口得自己给出可拖动的地方。
-          这条贯穿顶部的透明带就是拖拽区；它压在 .rail-head 上方，
-          而 .rail-head 已经下移让开了红绿灯，所以不会挡住任何按钮。 */}
+      {/* 原生标题栏已去掉。Mac 靠透明拖拽带；Windows 自绘最小化 / 最大化 / 关闭。 */}
       <div className="titlebar-drag" data-tauri-drag-region />
+      <WindowChrome closeHint={closeHint} onDismissHint={() => setCloseHint(false)} />
       <aside className="rail">
         <div className="rail-head">
           {/* 品牌区本身不可交互，顺带也做成拖拽区。
@@ -427,19 +443,7 @@ export default function App() {
             <button onClick={() => setError(null)} aria-label="关闭">×</button>
           </div>
         )}
-        {notice && (
-          <div
-            className="msg"
-            style={{
-              margin: "14px 24px 0",
-              color: "var(--signal)",
-              borderBottom: "1px solid var(--rule)",
-              paddingBottom: "8px",
-            }}
-          >
-            {notice}
-          </div>
-        )}
+        {notice && <div className="stage-notice">{notice}</div>}
 
         <div className="stage-body">
           {stage.kind === "session" && (

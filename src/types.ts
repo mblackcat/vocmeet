@@ -110,6 +110,10 @@ export interface DeltaEvent {
 
 export interface LlmConfig {
   api_base: string;
+  /** ollama / openai / anthropic / gemini。空则按地址猜。 */
+  provider?: string;
+  /** chat / chat_compat 走 /chat/completions，responses 走 /responses。 */
+  api_format?: string;
   model: string;
   context_tokens: number;
   temperature: number;
