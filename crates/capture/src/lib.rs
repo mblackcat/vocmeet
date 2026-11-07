@@ -301,6 +301,30 @@ fn system_track_has_no_audio(peak: f32, chunk_count: usize) -> bool {
     chunk_count == 0 || peak < SILENCE_PEAK
 }
 
+/// 判定麦克风轨是否被系统「静默拦截」：每个采样都是精确的 0，或一个分片都没有。
+///
+/// 与系统轨不同，这里**不**用 `SILENCE_PEAK`：真实麦克风即使在安静房间里也有底噪，
+/// 峰值可能低于门限却绝不会是精确的 0。精确的 0 只有一个来源——
+/// macOS 拒绝了麦克风访问（未授权，或安装包开了 Hardened Runtime 却缺
+/// `com.apple.security.device.audio-input`），CoreAudio 照常回调但全填零，不报任何错。
+pub fn mic_track_is_blank(peak: f32, chunk_count: usize) -> bool {
+    chunk_count == 0 || peak == 0.0
+}
+
+/// 麦克风轨被静默拦截时给用户的提示。录制中与录制后共用。
+pub fn mic_blank_warning() -> String {
+    let mut m = String::from("麦克风录到的是纯数字静音（每个采样都是 0），本机发言不会进入转写。");
+    if cfg!(target_os = "macos") {
+        m.push_str(
+            "这是 macOS 拒绝麦克风访问的典型表现：请检查「系统设置 → 隐私与安全性 → 麦克风」\
+             是否已勾选 VocMeet。升级安装包后授权可能失效，需要关掉再重新勾选。",
+        );
+    } else {
+        m.push_str("请检查系统隐私设置是否允许 VocMeet 使用麦克风，以及默认输入设备是否正确。");
+    }
+    m
+}
+
 /// 系统轨没录到声音时给用户的提示。两个平台的成因不同，给的指引也不同。
 ///
 /// 录制结束后的告警与录制中的实时告警共用这一份文案，避免两处说法不一致。
@@ -930,7 +954,12 @@ pub fn record_dual_track_with_levels(
     // 任一轨失败不应让整场录制丢失——另一轨的数据仍然有价值。
     if let Some(h) = mic_handle {
         match h.join() {
-            Ok(Ok(t)) => out.mic_chunks = t.chunks,
+            Ok(Ok(t)) => {
+                if mic_track_is_blank(t.peak, t.chunks.len()) {
+                    out.warnings.push(mic_blank_warning());
+                }
+                out.mic_chunks = t.chunks;
+            }
             Ok(Err(e)) => out.warnings.push(format!("麦克风轨失败：{e}")),
             Err(_) => out.warnings.push("麦克风轨线程 panic".into()),
         }
@@ -967,6 +996,25 @@ mod tests {
         assert!(!system_track_has_no_audio(0.5, 3));
         // 阈值边界：等于阈值不算静音
         assert!(!system_track_has_no_audio(SILENCE_PEAK, 1));
+    }
+
+    #[test]
+    fn blank_mic_track_is_flagged() {
+        // 每个采样都是精确的 0：macOS 拒绝麦克风访问时 CoreAudio 就这么交差
+        assert!(mic_track_is_blank(0.0, 3));
+        // 一个回调都没来
+        assert!(mic_track_is_blank(0.0, 0));
+        // 安静房间里的底噪远低于 SILENCE_PEAK，但绝不会是精确的 0——不能误报
+        assert!(!mic_track_is_blank(1e-5, 3));
+    }
+
+    #[test]
+    fn mic_blank_warning_points_at_the_actual_fix() {
+        let w = mic_blank_warning();
+        assert!(w.contains("麦克风"), "要说清是哪条轨");
+        if cfg!(target_os = "macos") {
+            assert!(w.contains("隐私与安全性"), "macOS 上必须指向权限设置项");
+        }
     }
 
     #[test]
