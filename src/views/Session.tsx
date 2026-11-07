@@ -40,6 +40,14 @@ const TRACKS: Array<{ key: TrackSource; label: string }> = [
 ];
 
 /**
+ * 判定一条轨「收到音了」的峰值门限。
+ *
+ * 麦克风只要不是精确的 0 就算——底噪也说明设备在工作。系统轨只在有声音播放时才有数据，
+ * 线下会议里它一直静默是正常的，所以要真有信号才显示，与后端 `SILENCE_PEAK` 同值。
+ */
+const HEARD_PEAK: Record<TrackSource, number> = { Mic: 0, System: 1e-4 };
+
+/**
  * rms → 条形高度（0..1）。
  *
  * 线性映射在会议语音这种小信号上几乎看不出动静——人耳是对数的，表也得是。
@@ -111,10 +119,16 @@ export default function Session({
   const [step, setStep] = useState<ProcessEvent | null>(null);
   /** 转写阶段的细粒度进度，来自引擎自己的 stage 事件。 */
   const [asr, setAsr] = useState<number | null>(null);
-  /** 录制中的告警（目前只有系统轨静音）。后端判定，前端只负责显示。 */
-  const [warning, setWarning] = useState<string | null>(null);
+  /** 录制中的告警（目前只有麦克风被系统拦截）。后端判定，前端只负责显示。 */
+  // 按 kind 分开存：两条轨可能同时出问题，后到的不能盖掉先到的。
+  const [warnings, setWarnings] = useState<Record<string, string>>({});
   /** 会中实时逐字稿。只保留最近 LIVE_KEEP 行，长会议不至于把 DOM 撑爆。 */
   const [live, setLive] = useState<LiveLine[]>([]);
+  /**
+   * 已经收到过声音的轨。只显示这些——没收音的轨不画、也不提示。
+   * 一条都还没收到时先摆出麦克风那条，免得底栏空着。
+   */
+  const [heard, setHeard] = useState<ReadonlySet<TrackSource>>(new Set());
   /** 实时转写不可用时的说明（引擎没起来等）。 */
   const [liveOff, setLiveOff] = useState<string | null>(null);
   const bottom = useRef<HTMLDivElement>(null);
@@ -146,9 +160,15 @@ export default function Session({
         if (!h) return;
         h.push(toHeight(e.rms));
         if (h.length > METER_SLOTS) h.splice(0, h.length - METER_SLOTS);
+        // 只在「第一次听到」时 setState 一次，20Hz 的电平流本身不触发重渲染。
+        if (e.peak > HEARD_PEAK[e.source]) {
+          setHeard((prev) => (prev.has(e.source) ? prev : new Set(prev).add(e.source)));
+        }
       })
       .then((f) => off.push(f));
-    void events.onRecordingWarning((e) => setWarning(e.message)).then((f) => off.push(f));
+    void events
+      .onRecordingWarning((e) => setWarnings((prev) => ({ ...prev, [e.kind]: e.message })))
+      .then((f) => off.push(f));
     void events
       .onLiveTranscript((e) => {
         setLive((prev) => {
@@ -174,7 +194,8 @@ export default function Session({
   useEffect(() => {
     if (!recording) {
       history.current = { Mic: [], System: [] };
-      setWarning(null);
+      setWarnings({});
+      setHeard(new Set());
       setLive([]);
       setLiveOff(null);
       return;
@@ -345,16 +366,20 @@ export default function Session({
               <div ref={liveBottom} />
             </div>
 
-            {warning && <p className="meter-warn">{warning}</p>}
+            {Object.entries(warnings).map(([kind, msg]) => (
+              <p key={kind} className="meter-warn">
+                {msg}
+              </p>
+            ))}
 
             {/* 电平表压成细条，但不能去掉——它是「有没有收音」的答案 */}
             <div className="live-foot">
               <div className="meter compact">
-                {TRACKS.map((t) => (
+                {TRACKS.filter((t) => heard.has(t.key) || (heard.size === 0 && t.key === "Mic")).map((t) => (
                   <TrackMeter
                     key={t.key}
                     label={t.label}
-                    silent={t.key === "System" && warning !== null}
+                    silent={t.key === "Mic" && "mic-blank" in warnings}
                     barsRef={(el) => {
                       barsEl.current[t.key] = el;
                     }}

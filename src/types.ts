@@ -209,7 +209,7 @@ export interface LevelEvent {
   peak: number;
 }
 
-/** 录制过程中的告警。目前只有系统轨静音一种。 */
+/** 录制过程中的告警。目前只有 `mic-blank`（麦克风被系统拦截）一种。 */
 export interface RecordingWarningEvent {
   meeting_id: number;
   kind: string;

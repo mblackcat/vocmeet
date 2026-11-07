@@ -238,9 +238,8 @@ h2.section {
 
 /* ---------- 录制中：双轨实时电平 ---------- */
 
-/* 两条轨分开画而不是混成一条：系统轨权限没给时它会是一条直线，
-   而麦克风轨照常起伏——这个对比就是「有没有收音」最直接的答案。
-   混成一条的话系统轨的静默会被麦克风轨的波动盖掉，看不出来。 */
+/* 两条轨分开画而不是混成一条，各自标明来源。
+   只画已经收到声音的轨（见 Session.tsx 的 heard），没收音的轨不出现、也不提示。 */
 .meter { display: flex; flex-direction: column; gap: 10px; width: 100%; max-width: 420px; }
 .meter-row { display: flex; align-items: center; gap: 12px; }
 .meter-label {
@@ -256,7 +255,7 @@ h2.section {
   flex: 1; min-width: 1px; height: 2%;
   background: var(--signal); opacity: 0.85;
 }
-/* 系统轨判定为静音：整条轨转成砖红，与录制点同色，表示「这里出问题了」 */
+/* 麦克风被系统拦截（全零）：整条轨转成砖红，与录制点同色，表示「这里出问题了」 */
 .meter-row.silent .meter-label { color: var(--live); }
 .meter-row.silent .meter-bars span { background: var(--live); opacity: 0.5; }
 
@@ -304,12 +303,14 @@ h2.section {
   display: flex; align-items: center; gap: 24px;
   padding: 14px 0 18px; border-top: 1px solid var(--rule);
 }
-/* 稿子上位之后电平表退成辅助信息，但保留双轨对比 */
-.meter.compact { max-width: 240px; gap: 5px; }
+/* 稿子上位之后电平表退成辅助信息：左侧来源 + 波形，右侧计时与结束按钮同一行 */
+.meter.compact { max-width: 260px; gap: 5px; }
 .meter.compact .meter-bars { height: 16px; }
-.meter.compact .meter-label { width: 34px; font-size: 10px; }
+/* 宽度按最长的「麦克风」三字 + 字距留足，nowrap 兜底——定死 34px 时会被挤成两行 */
+.meter.compact .meter-label { width: 42px; font-size: 10px; white-space: nowrap; }
 .live-foot .elapsed { margin-top: 0; margin-left: auto; }
-.live-foot .record { flex-direction: row; gap: 10px; }
+/* .record 自带开始页用的 56px 上边距，底栏里不清掉就会比计时器低一截 */
+.live-foot .record { flex-direction: row; gap: 10px; margin-top: 0; }
 
 .elapsed {
   font-family: var(--font-data); font-size: 13px; letter-spacing: 0.14em;

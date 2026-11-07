@@ -295,7 +295,7 @@ struct LevelEvent {
     peak: f32,
 }
 
-/// 录制过程中的告警。目前只有系统轨静音一种。
+/// 录制过程中的告警。目前只有麦克风被系统拦截（`mic-blank`）一种。
 #[derive(Serialize, Clone)]
 struct RecordingWarningEvent {
     meeting_id: i64,
@@ -303,7 +303,7 @@ struct RecordingWarningEvent {
     message: String,
 }
 
-/// 系统轨静默多久就告警。够长以躲开会议开场的安静，又远短于一场会。
+/// 麦克风持续全零多久就告警。够长以躲开会议开场的安静，又远短于一场会。
 const SILENCE_ALERT_AFTER: Duration = Duration::from_secs(10);
 
 /// 实时转写待处理队列的上限（段数）。
@@ -345,6 +345,7 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
 
     let out_dir = cfg.audio_dir().join(format!("meeting_{meeting_id}"));
     let record_system = cfg.capture.record_system;
+    let record_mic = cfg.capture.record_mic;
     let capture_cfg = vocmeet_capture::CaptureConfig {
         out_dir,
         chunk_seconds: cfg.capture.chunk_seconds,
@@ -354,16 +355,17 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
         live_segment_seconds: cfg.capture.live_segment_seconds,
     };
 
-    // 系统轨最后一次听到声音的时刻，以录制开始为 0 点，单位毫秒。
+    // 麦克风轨最后一次「活着」的时刻，以录制开始为 0 点，单位毫秒。
+    // 门限是「非精确 0」：底噪也算活着，只有全零才是被系统拦截。
     // 看门狗线程读它，采集线程写它——用原子量而不是锁，免得拖慢采集回调。
     let started = Instant::now();
-    let last_audio_ms = Arc::new(AtomicU64::new(0));
+    let mic_alive_ms = Arc::new(AtomicU64::new(0));
 
     let level_app = app.clone();
-    let level_seen = last_audio_ms.clone();
+    let mic_seen = mic_alive_ms.clone();
     let sink: vocmeet_capture::LevelSink = Arc::new(move |s: vocmeet_capture::LevelSample| {
-        if s.source == vocmeet_core::Source::System && s.peak >= vocmeet_capture::SILENCE_PEAK {
-            level_seen.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
+        if s.source == vocmeet_core::Source::Mic && s.peak > 0.0 {
+            mic_seen.store(started.elapsed().as_millis() as u64, Ordering::Relaxed);
         }
         let _ = level_app.emit(
             "recording-level",
@@ -529,35 +531,36 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
         )
     });
 
-    // 看门狗：系统轨持续静默就提前告警，不等录完。
+    // 看门狗：麦克风被系统拦截（持续全零）就提前告警，不等录完。
     //
-    // 判断必须由挂钟驱动而不是由电平事件驱动——macOS 上 tap 在完全没有音频流过时
-    // 根本不触发回调，那种情况下一个电平事件都不会来，事件驱动的检测永远不会响。
+    // 系统轨不告警：它只在有声音播放时才有数据，线下会议里静默是常态，
+    // 产品上的约定是「有收音就显示那条轨，没有就不提」。
+    //
+    // 判断必须由挂钟驱动而不是由电平事件驱动——设备一个回调都不来时
+    // 一个电平事件也不会有，事件驱动的检测永远不会响。
     let watchdog_stop = Arc::new(AtomicBool::new(false));
-    let watchdog = if record_system {
+    let watchdog = if record_mic {
         let flag = watchdog_stop.clone();
-        let seen = last_audio_ms.clone();
+        let seen = mic_alive_ms.clone();
         let wd_app = app.clone();
         Some(std::thread::spawn(move || {
-            let mut fired = false;
             while !flag.load(Ordering::Relaxed) {
                 std::thread::sleep(Duration::from_millis(500));
-                if fired || flag.load(Ordering::Relaxed) {
-                    continue;
+                if flag.load(Ordering::Relaxed) {
+                    break;
                 }
-                let elapsed = started.elapsed();
                 let quiet_since = Duration::from_millis(seen.load(Ordering::Relaxed));
-                if elapsed.saturating_sub(quiet_since) >= SILENCE_ALERT_AFTER {
+                if started.elapsed().saturating_sub(quiet_since) >= SILENCE_ALERT_AFTER {
                     let _ = wd_app.emit(
                         "recording-warning",
                         RecordingWarningEvent {
                             meeting_id,
-                            kind: "system-silent".into(),
+                            kind: "mic-blank".into(),
                             // 与录制结束后的告警共用同一份文案。
-                            message: vocmeet_capture::silence_warning(),
+                            message: vocmeet_capture::mic_blank_warning(),
                         },
                     );
-                    fired = true;
+                    break;
                 }
             }
         }))
