@@ -16,12 +16,63 @@ use sha2::{Digest, Sha256};
 
 use crate::{Error, Result};
 
+/// 可选的识别模型。VAD / 声纹 / 标点三套是共用的，只有 ASR 这一份可换。
+///
+///
+/// 不实现 `Default`：新装与升级的默认值不同，见 [`crate::config::EngineConfig`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AsrModel {
+    /// SenseVoice-Small int8：最小最快，中文准确率一般。
+    SenseVoice,
+    /// FireRedASR2 AED int8：中文明显更准，ASR 耗时约为 SenseVoice 的 6~7 倍。
+    ///
+    /// 同期还有个 FireRedASR2 CTC 版，实测（57s 四人中文 + 七段方言/中英混说）
+    /// 准确率与 SenseVoice 互有胜负、却慢 5 倍多，所以没收。
+    FireRedAed,
+}
+
+/// 一个识别模型的全部静态信息：目录、文件名、下载地址、期望校验和。
+struct AsrSpec {
+    dir: &'static str,
+    /// SenseVoice 是单个模型文件；AED 是 encoder。
+    model_file: &'static str,
+    /// 仅 AED 有。
+    decoder_file: Option<&'static str>,
+    asset: Asset,
+    /// 解压后文件的 SHA256，按 `entries()` 的名字对应。
+    sha256: &'static [(&'static str, &'static str)],
+}
+
+impl AsrModel {
+    pub const ALL: [AsrModel; 2] = [AsrModel::SenseVoice, AsrModel::FireRedAed];
+
+    fn spec(self) -> &'static AsrSpec {
+        match self {
+            AsrModel::SenseVoice => &SENSE_VOICE,
+            AsrModel::FireRedAed => &FIRE_RED_AED,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        self.spec().asset.label
+    }
+
+    /// 这个识别模型的压缩包体积。
+    pub fn download_bytes(self) -> u64 {
+        self.spec().asset.approx_bytes
+    }
+}
+
 /// 一套完整的推理权重。
 #[derive(Debug, Clone)]
 pub struct ModelSet {
     pub root: PathBuf,
-    /// SenseVoice int8 ASR 模型。
+    pub asr: AsrModel,
+    /// SenseVoice 的模型文件，或 FireRed AED 的 encoder。
     pub asr_model: PathBuf,
+    /// FireRed AED 的 decoder；其余模型为 None。
+    pub asr_decoder: Option<PathBuf>,
     pub asr_tokens: PathBuf,
     /// Silero VAD。
     pub vad_model: PathBuf,
@@ -34,16 +85,21 @@ pub struct ModelSet {
 }
 
 const SENSE_VOICE_DIR: &str = "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09";
+const FIRE_RED_AED_DIR: &str = "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26";
 const PYANNOTE_DIR: &str = "sherpa-onnx-pyannote-segmentation-3-0";
 const PUNCT_DIR: &str = "sherpa-onnx-punct-ct-transformer-zh-en-vocab272727-2024-04-12-int8";
 
 impl ModelSet {
     /// 按 `scripts/fetch-models.sh` 的目录约定解析路径。
-    pub fn from_root(root: impl Into<PathBuf>) -> Self {
+    pub fn from_root(root: impl Into<PathBuf>, asr: AsrModel) -> Self {
         let root = root.into();
+        let spec = asr.spec();
+        let asr_dir = root.join(spec.dir);
         Self {
-            asr_model: root.join(SENSE_VOICE_DIR).join("model.int8.onnx"),
-            asr_tokens: root.join(SENSE_VOICE_DIR).join("tokens.txt"),
+            asr,
+            asr_model: asr_dir.join(spec.model_file),
+            asr_decoder: spec.decoder_file.map(|f| asr_dir.join(f)),
+            asr_tokens: asr_dir.join("tokens.txt"),
             vad_model: root.join("silero_vad.onnx"),
             segmentation_model: root.join(PYANNOTE_DIR).join("model.onnx"),
             embedding_model: root.join("speaker-embedding.onnx"),
@@ -53,14 +109,29 @@ impl ModelSet {
     }
 
     fn entries(&self) -> Vec<(&'static str, &Path)> {
-        vec![
-            ("asr_model", &self.asr_model),
-            ("asr_tokens", &self.asr_tokens),
+        let mut out = vec![("asr_model", self.asr_model.as_path())];
+        if let Some(d) = &self.asr_decoder {
+            out.push(("asr_decoder", d.as_path()));
+        }
+        out.extend([
+            ("asr_tokens", self.asr_tokens.as_path()),
             ("vad_model", &self.vad_model),
             ("segmentation_model", &self.segmentation_model),
             ("embedding_model", &self.embedding_model),
             ("punctuation_model", &self.punctuation_model),
-        ]
+        ]);
+        out
+    }
+
+    /// 这套权重每个文件的期望 SHA256：识别模型自己的 + 共用的。
+    pub fn expected_sha256(&self) -> Vec<(String, String)> {
+        self.asr
+            .spec()
+            .sha256
+            .iter()
+            .chain(SHARED_SHA256)
+            .map(|(n, h)| (n.to_string(), h.to_string()))
+            .collect()
     }
 
     /// 校验全部权重存在。缺失时报出具体是哪个模型、该跑什么命令修。
@@ -141,12 +212,11 @@ pub enum AssetKind {
     TarBz2 { dir: &'static str },
 }
 
-/// 与 `scripts/fetch-models.sh` 同源的资产清单。
-///
-/// 两处必须一致：脚本是 CI 与无 GUI 场景的路径，这里是应用内一键下载的路径。
-/// 改任何一处都要同步改另一处。
-pub const ASSETS: &[Asset] = &[
-    Asset {
+static SENSE_VOICE: AsrSpec = AsrSpec {
+    dir: SENSE_VOICE_DIR,
+    model_file: "model.int8.onnx",
+    decoder_file: None,
+    asset: Asset {
         label: "识别模型 SenseVoice",
         url: concat!(
             "https://github.com/k2-fsa/sherpa-onnx/releases/download",
@@ -157,6 +227,45 @@ pub const ASSETS: &[Asset] = &[
         },
         approx_bytes: 165_783_878,
     },
+    sha256: &[
+        (
+            "asr_model",
+            "12ca1a2ae7ecf3e0019ef2822307ee0b5cadc9196569e379b4c4026f8205276d",
+        ),
+        (
+            "asr_tokens",
+            "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
+        ),
+    ],
+};
+
+static FIRE_RED_AED: AsrSpec = AsrSpec {
+    dir: FIRE_RED_AED_DIR,
+    model_file: "encoder.int8.onnx",
+    decoder_file: Some("decoder.int8.onnx"),
+    asset: Asset {
+        label: "识别模型 FireRedASR2-AED",
+        url: concat!(
+            "https://github.com/k2-fsa/sherpa-onnx/releases/download",
+            "/asr-models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2"
+        ),
+        kind: AssetKind::TarBz2 {
+            dir: FIRE_RED_AED_DIR,
+        },
+        approx_bytes: 838_589_068,
+    },
+    sha256: &[
+        ("asr_model", "54048d66b6e8f3c80ea7ce95efe794587b0fd81d7271651d0decd3803852ae82"),
+        ("asr_decoder", "b840ce7196ae4a14d05ae84bbf56082b6b61ccec5610fda907dddbcea37354ff"),
+        ("asr_tokens", "1bc613de2112d257e61a349c3e72d1b1a9cf19c33d3ca954197ad2171e5ea07b"),
+    ],
+};
+
+/// 与识别模型无关、每套都要的资产。
+///
+/// 和 `scripts/fetch-models.sh` 同源，两处必须一致：脚本是 CI 与无 GUI 场景的路径，
+/// 这里是应用内一键下载的路径。改任何一处都要同步改另一处。
+const SHARED_ASSETS: &[Asset] = &[
     Asset {
         label: "静音检测 Silero VAD",
         url: concat!(
@@ -201,19 +310,11 @@ pub const ASSETS: &[Asset] = &[
     },
 ];
 
-/// 六个最终文件的期望 SHA256。
+/// 共用文件的期望 SHA256。识别模型的在各自的 [`AsrSpec`] 里。
 ///
 /// 取自本机跑通过全链路的那一套权重（见 README 实测记录）。上游 release 是
 /// 带日期的固定 tag，不会原地更新；真对不上就是下载损坏或上游动过手脚，两种都该拦。
-pub const EXPECTED_SHA256: &[(&str, &str)] = &[
-    (
-        "asr_model",
-        "12ca1a2ae7ecf3e0019ef2822307ee0b5cadc9196569e379b4c4026f8205276d",
-    ),
-    (
-        "asr_tokens",
-        "f449eb28dc567533d7fa59be34e2abca8784f771850c78a47fb731a31429a1dc",
-    ),
+const SHARED_SHA256: &[(&str, &str)] = &[
     (
         "vad_model",
         "9e2449e1087496d8d4caba907f23e0bd3f78d91fa552479bb9c23ac09cbb1fd6",
@@ -232,9 +333,16 @@ pub const EXPECTED_SHA256: &[(&str, &str)] = &[
     ),
 ];
 
+/// 选定识别模型时要下载的全部资产：识别模型在前，共用的在后。
+pub fn assets(asr: AsrModel) -> Vec<Asset> {
+    std::iter::once(asr.spec().asset)
+        .chain(SHARED_ASSETS.iter().copied())
+        .collect()
+}
+
 /// 下载总体积的粗略值，用于「要下 xxx MB」这句提示。
-pub fn total_download_bytes() -> u64 {
-    ASSETS.iter().map(|a| a.approx_bytes).sum()
+pub fn total_download_bytes(asr: AsrModel) -> u64 {
+    assets(asr).iter().map(|a| a.approx_bytes).sum()
 }
 
 /// 下载阶段。解压与校验都可能耗时几十秒，不报出来用户会以为卡死。
@@ -270,18 +378,21 @@ pub struct FetchProgress {
 /// 与 LocalOnly 策略要防的静默外泄不是一回事。调用方仍应写一条审计行。
 pub async fn fetch_all(
     root: &Path,
+    asr: AsrModel,
     on_progress: &dyn Fn(FetchProgress),
     cancel: &dyn Fn() -> bool,
 ) -> Result<()> {
     std::fs::create_dir_all(root).map_err(|e| Error::io(root, e))?;
 
-    let set = ModelSet::from_root(root);
-    // 已经全好了就别白下一遍 360MB。
-    if set.verify_present().is_ok() && set.verify_checksums(&expected_owned()).is_ok() {
+    let set = ModelSet::from_root(root, asr);
+    let expected = set.expected_sha256();
+    let assets = assets(asr);
+    // 已经全好了就别白下一遍几百 MB。
+    if set.verify_present().is_ok() && set.verify_checksums(&expected).is_ok() {
         on_progress(FetchProgress {
             phase: FetchPhase::Done,
-            index: ASSETS.len(),
-            total_assets: ASSETS.len(),
+            index: assets.len(),
+            total_assets: assets.len(),
             label: "全部权重已就位",
             received: 0,
             total: None,
@@ -290,14 +401,14 @@ pub async fn fetch_all(
         return Ok(());
     }
 
-    let grand_total: u64 = total_download_bytes().max(1);
+    let grand_total: u64 = total_download_bytes(asr).max(1);
     let mut done_bytes: u64 = 0;
     let client = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| Error::Other(anyhow::anyhow!("构建 HTTP 客户端失败: {e}")))?;
 
-    for (index, asset) in ASSETS.iter().enumerate() {
+    for (index, asset) in assets.iter().enumerate() {
         if cancel() {
             return Err(Error::Cancelled);
         }
@@ -307,7 +418,7 @@ pub async fn fetch_all(
             on_progress(FetchProgress {
                 phase,
                 index,
-                total_assets: ASSETS.len(),
+                total_assets: assets.len(),
                 label: asset.label,
                 received,
                 total,
@@ -341,35 +452,27 @@ pub async fn fetch_all(
     }
     on_progress(FetchProgress {
         phase: FetchPhase::Verifying,
-        index: ASSETS.len(),
-        total_assets: ASSETS.len(),
+        index: assets.len(),
+        total_assets: assets.len(),
         label: "校验完整性",
         received: 0,
         total: None,
         overall: 1.0,
     });
 
-    let set = ModelSet::from_root(root);
     set.verify_present()?;
-    set.verify_checksums(&expected_owned())?;
+    set.verify_checksums(&expected)?;
 
     on_progress(FetchProgress {
         phase: FetchPhase::Done,
-        index: ASSETS.len(),
-        total_assets: ASSETS.len(),
+        index: assets.len(),
+        total_assets: assets.len(),
         label: "全部权重就位",
         received: 0,
         total: None,
         overall: 1.0,
     });
     Ok(())
-}
-
-fn expected_owned() -> Vec<(String, String)> {
-    EXPECTED_SHA256
-        .iter()
-        .map(|(n, h)| (n.to_string(), h.to_string()))
-        .collect()
 }
 
 /// 这个资产是不是已经铺好了。只看存在性——完整校验留到最后统一做一次。
@@ -484,16 +587,17 @@ mod tests {
 
     #[test]
     fn paths_follow_fetch_script_layout() {
-        let m = ModelSet::from_root("models");
+        let m = ModelSet::from_root("models", AsrModel::SenseVoice);
         assert!(m.asr_model.ends_with("model.int8.onnx"));
         assert!(m.asr_model.to_string_lossy().contains(SENSE_VOICE_DIR));
+        assert!(m.asr_decoder.is_none());
         assert!(m.vad_model.ends_with("silero_vad.onnx"));
         assert!(m.embedding_model.ends_with("speaker-embedding.onnx"));
     }
 
     #[test]
     fn missing_model_reports_name_and_path() {
-        let m = ModelSet::from_root("definitely-not-here");
+        let m = ModelSet::from_root("definitely-not-here", AsrModel::SenseVoice);
         let err = m.verify_present().unwrap_err();
         match err {
             Error::ModelMissing { name, .. } => assert_eq!(name, "asr_model"),
@@ -504,15 +608,31 @@ mod tests {
 
     #[test]
     fn expected_checksums_cover_every_model_file() {
-        let set = ModelSet::from_root("x");
-        let names: Vec<&str> = set.entries().into_iter().map(|(n, _)| n).collect();
-        for name in &names {
-            assert!(
-                EXPECTED_SHA256.iter().any(|(n, _)| n == name),
-                "{name} 没有期望校验和，下载完就没人拦得住它损坏"
-            );
+        for asr in AsrModel::ALL {
+            let set = ModelSet::from_root("x", asr);
+            let expected = set.expected_sha256();
+            let names: Vec<&str> = set.entries().into_iter().map(|(n, _)| n).collect();
+            for name in &names {
+                assert!(
+                    expected.iter().any(|(n, _)| n == name),
+                    "{asr:?} 的 {name} 没有期望校验和，下载完就没人拦得住它损坏"
+                );
+            }
+            assert_eq!(expected.len(), names.len(), "{asr:?} 多余或缺失的校验和条目");
         }
-        assert_eq!(EXPECTED_SHA256.len(), names.len(), "多余或缺失的校验和条目");
+    }
+
+    #[test]
+    fn fire_red_aed_has_a_decoder() {
+        let m = ModelSet::from_root("x", AsrModel::FireRedAed);
+        assert!(m.asr_decoder.is_some());
+        assert!(m.asr_model.to_string_lossy().contains(FIRE_RED_AED_DIR));
+    }
+
+    #[test]
+    fn asr_model_serializes_as_snake_case() {
+        let j = serde_json::to_string(&AsrModel::FireRedAed).unwrap();
+        assert_eq!(j, "\"fire_red_aed\"");
     }
 
     #[test]
@@ -524,7 +644,8 @@ mod tests {
             "/../../scripts/fetch-models.sh"
         ))
         .expect("读不到 scripts/fetch-models.sh");
-        for asset in ASSETS {
+        let all = AsrModel::ALL.iter().map(|a| a.spec().asset).chain(SHARED_ASSETS.iter().copied());
+        for asset in all {
             let tail = asset.url.rsplit('/').next().unwrap();
             assert!(
                 script.contains(tail),
@@ -536,7 +657,7 @@ mod tests {
 
     #[test]
     fn download_size_is_the_compressed_total() {
-        let total = total_download_bytes();
+        let total = total_download_bytes(AsrModel::SenseVoice);
         // 压缩包合计约 265MiB；解压后是 359MB。报错的值多半是把解压后的填进去了。
         assert!(
             (270_000_000..290_000_000).contains(&total),

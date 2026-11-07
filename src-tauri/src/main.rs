@@ -143,7 +143,7 @@ struct DeltaEvent {
 #[tauri::command]
 fn doctor(state: State<AppState>) -> R<DoctorReport> {
     let cfg = state.config()?;
-    let models = ModelSet::from_root(&cfg.models_dir);
+    let models = cfg.model_set();
 
     let (models_ok, models_message, model_files, total_mb) = match models.verify_present() {
         Ok(()) => {
@@ -407,12 +407,12 @@ fn start_recording(app: AppHandle, state: State<AppState>, title: String) -> R<i
     let live_handle = if live_on {
         let app_live = app.clone();
         let q = queued.clone();
-        let models_dir = cfg.models_dir.clone();
+        let models = cfg.model_set();
         let engine_opts = cfg.engine.to_options();
         Some(std::thread::spawn(move || {
             // 引擎加载一次整场复用（实测 0.7s）。加载失败不该让录制挂掉——
             // 实时稿只是加分项，录音本身与会后转写都不依赖它。
-            let engine = match SherpaEngine::new(&ModelSet::from_root(&models_dir), engine_opts) {
+            let engine = match SherpaEngine::new(&models, engine_opts) {
                 Ok(e) => e,
                 Err(e) => {
                     tracing::warn!("实时转写引擎加载失败，本场退回会后整轨转写：{e}");
@@ -814,7 +814,7 @@ fn run_transcription(
     };
 
     emit(Stage::LoadingModels, 0.0, "加载模型");
-    let models = ModelSet::from_root(&cfg.models_dir);
+    let models = cfg.model_set();
     let engine = SherpaEngine::new(&models, cfg.engine.to_options()).map_err(err)?;
     emit(Stage::LoadingModels, 1.0, "模型就绪");
 
@@ -1023,10 +1023,10 @@ struct ModelPlan {
 fn model_download_plan(state: State<AppState>) -> R<ModelPlan> {
     let cfg = state.config()?;
     Ok(ModelPlan {
-        already_present: ModelSet::from_root(&cfg.models_dir).verify_present().is_ok(),
+        already_present: cfg.model_set().verify_present().is_ok(),
         models_dir: cfg.models_dir.display().to_string(),
-        total_bytes: vocmeet_core::models::total_download_bytes(),
-        assets: vocmeet_core::models::ASSETS
+        total_bytes: vocmeet_core::models::total_download_bytes(cfg.engine.asr_model),
+        assets: vocmeet_core::models::assets(cfg.engine.asr_model)
             .iter()
             .map(|a| a.label.to_string())
             .collect(),
@@ -1055,6 +1055,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> R<()> {
         cfg.data_dir.join("models")
     };
 
+    let asr = cfg.engine.asr_model;
     let cancel = CancelToken::new();
     *state.model_fetch_cancel.lock().map_err(|_| "下载锁中毒")? = Some(cancel.clone());
 
@@ -1079,6 +1080,7 @@ fn download_models(app: AppHandle, state: State<AppState>) -> R<()> {
             .and_then(|rt| {
                 rt.block_on(vocmeet_core::models::fetch_all(
                     &dest,
+                    asr,
                     &emit,
                     &|| cancel.is_cancelled(),
                 ))
@@ -1139,10 +1141,10 @@ fn set_models_dir(state: State<AppState>, path: String) -> R<String> {
     if !dir.is_dir() {
         return Err(format!("这不是一个目录：{path}"));
     }
-    let set = ModelSet::from_root(&dir);
+    let mut guard = state.config.lock().map_err(|_| "配置锁中毒")?;
+    let set = ModelSet::from_root(&dir, guard.engine.asr_model);
     set.verify_present().map_err(err)?;
 
-    let mut guard = state.config.lock().map_err(|_| "配置锁中毒")?;
     guard.models_dir = dir;
     guard.save(&state.config_path).map_err(err)?;
     Ok(format!("已指向 {path}"))

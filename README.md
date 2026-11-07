@@ -32,7 +32,9 @@ GUI 已实现并能打出安装包（Windows：MSI / NSIS；macOS：app / dmg，
 - `nsis/VocMeet_0.1.0_x64-setup.exe`（9.8 MB）
 - macOS：`macos/VocMeet.app` 与 `dmg/VocMeet_0.1.0_aarch64.dmg`
 
-安装包**不含 ONNX 权重**（约 360MB）。首次启动到设置页点「一键下载模型」即可，
+安装包**不含 ONNX 权重**（默认的 FireRedASR2 一套约 950MB 下载 / 1.3GB 解压；
+设置页可换成 SenseVoice，约 280MB 下载 / 360MB 解压，更快但中文准确率一般）。
+首次启动到设置页点「一键下载模型」即可，
 下完自动生效，不用手动指目录。没有网络或者已经有一套权重的话，
 也可以跑 `scripts/fetch-models.sh`，再用「已经有了，指个目录」指过去。
 
@@ -86,7 +88,7 @@ npx tauri dev
 
 | 缺什么 | 怎么办 |
 | :--- | :--- |
-| 识别模型（ONNX 权重，约 265MB 下载 / 359MB 解压） | 点「一键下载模型」。下载 → 解压 → 校验 SHA256 → 写回配置，全自动 |
+| 识别模型（ONNX 权重，FireRedASR2 约 950MB 下载 / 1.3GB 解压；SenseVoice 约 280MB / 360MB） | 点「一键下载模型」。下载 → 解压 → 校验 SHA256 → 写回配置，全自动 |
 | 写纪要的模型（本机 Ollama） | 端点体检会分清「服务没起来」「起来了但没装模型」「模型名不对」，缺模型时直接给「拉取 qwen2.5:7b」这类按钮 |
 
 模型输入框带下拉，列的是端点上**真实装着**的模型——打错名字只会得到一个 404，
@@ -143,7 +145,8 @@ ogg / oga    mka / webm   aiff / aif / aifc   caf
 ### 构建
 
 ```bash
-bash scripts/fetch-models.sh models     # 下载 ONNX 权重（约 360MB 解压后）
+bash scripts/fetch-models.sh models     # 下载 ONNX 权重（FireRedASR2，约 1.3GB 解压后）
+# bash scripts/fetch-models.sh models sense_voice   # 或者小而快的 SenseVoice（约 360MB）
 cargo build --release -p vocmeet-cli
 ```
 
@@ -240,7 +243,8 @@ vocmeet/
 静态链接进 Apache-2.0 应用不构成传染，改动 symphonia 自身的源码才需要回馈。
 本仓库只调用不修改，无额外义务。
 
-`models/` 下的权重各有其协议，**其中 SenseVoice 与 CT-Punc 适用阿里 FunASR 模型开源协议**，
+`models/` 下的权重各有其协议。默认识别模型 FireRedASR2 为 Apache-2.0，可商用；
+**可选的 SenseVoice 与始终要用的 CT-Punc 适用阿里 FunASR 模型开源协议**，
 该协议含「仅供参考和学习使用」表述。内部试用不构成阻断，**商业化前必须取得法务结论**。
 pyannote-segmentation-3.0 为 MIT，3D-Speaker 为 Apache-2.0，均可商用。
 

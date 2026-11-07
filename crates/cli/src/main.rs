@@ -13,9 +13,9 @@ use vocmeet_core::asr::{
 };
 use vocmeet_core::audio;
 use vocmeet_core::config::Config;
+use vocmeet_core::models::AsrModel;
 use vocmeet_core::jobs::overall_progress;
 use vocmeet_core::llm::LlmClient;
-use vocmeet_core::models::ModelSet;
 use vocmeet_core::store::{self, Store};
 use vocmeet_core::summarize::{RenderInput, Summarizer, Template};
 use vocmeet_core::{format_ts, Source, Utterance};
@@ -30,6 +30,10 @@ struct Cli {
     /// 覆盖模型目录。
     #[arg(long, global = true)]
     models: Option<PathBuf>,
+
+    /// 覆盖识别模型：sense_voice | fire_red_aed。
+    #[arg(long, global = true, value_parser = parse_asr)]
+    asr: Option<AsrModel>,
 
     #[command(subcommand)]
     command: Command,
@@ -144,6 +148,9 @@ fn main() -> Result<()> {
     if let Some(m) = &cli.models {
         config.models_dir = m.clone();
     }
+    if let Some(a) = cli.asr {
+        config.engine.asr_model = a;
+    }
     config.ensure_dirs()?;
 
     match cli.command {
@@ -252,6 +259,11 @@ fn record(
     Ok(())
 }
 
+fn parse_asr(s: &str) -> std::result::Result<AsrModel, String> {
+    serde_json::from_value(serde_json::Value::String(s.to_string()))
+        .map_err(|_| format!("未知识别模型 {s}（可选 sense_voice | fire_red_aed）"))
+}
+
 fn open_store(config: &Config) -> Result<Store> {
     let key = store::master_key().context("读取/创建数据库主密钥失败（Keychain 不可用？）")?;
     Store::open(config.db_path(), &key).context("打开数据库失败")
@@ -261,11 +273,12 @@ fn doctor(config: &Config) -> Result<()> {
     println!("VocMeet 自检");
     println!("  数据目录 : {}", config.data_dir.display());
     println!("  模型目录 : {}", config.models_dir.display());
+    println!("  识别模型 : {}", config.engine.asr_model.label().trim_start_matches("识别模型 "));
     println!("  出网策略 : {:?}", config.egress_policy);
     println!("  LLM 端点 : {}", config.llm.api_base);
     println!();
 
-    let models = ModelSet::from_root(&config.models_dir);
+    let models = config.model_set();
     match models.verify_present() {
         Ok(()) => {
             println!("模型完整性：");
@@ -319,7 +332,7 @@ fn transcribe(
         "至少提供 --system 或 --mic 之一"
     );
 
-    let models = ModelSet::from_root(&config.models_dir);
+    let models = config.model_set();
     let t0 = std::time::Instant::now();
     eprintln!("加载模型…");
     let engine = SherpaEngine::new(&models, config.engine.to_options())?;

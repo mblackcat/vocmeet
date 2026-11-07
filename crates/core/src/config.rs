@@ -4,6 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use crate::asr::EngineOptions;
+use crate::models::{AsrModel, ModelSet};
 use crate::policy::EgressPolicy;
 use crate::{Error, Result};
 
@@ -65,6 +66,13 @@ impl Default for LlmConfig {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 #[serde(default)]
 pub struct EngineConfig {
+    /// 用哪个识别模型。换模型要先下载对应权重。
+    ///
+    /// 新装默认 FireRedASR2（中文更准）；而升级前的配置文件里没有这个字段，
+    /// 读出来要落到 SenseVoice——那些机器上只有 SenseVoice 的权重，
+    /// 悄悄换成 FireRed 会让下一场会议直接报「模型缺失」、逼人先下 840MB。
+    #[serde(default = "legacy_asr_model")]
+    pub asr_model: AsrModel,
     pub num_threads: i32,
     pub provider: String,
     pub cluster_threshold: f32,
@@ -78,6 +86,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         let d = EngineOptions::default();
         Self {
+            asr_model: AsrModel::FireRedAed,
             num_threads: d.num_threads,
             provider: d.provider,
             cluster_threshold: d.cluster_threshold,
@@ -86,6 +95,10 @@ impl Default for EngineConfig {
             diar_window_shift_ratio: d.diar_window_shift_ratio,
         }
     }
+}
+
+fn legacy_asr_model() -> AsrModel {
+    AsrModel::SenseVoice
 }
 
 impl EngineConfig {
@@ -262,6 +275,11 @@ impl Config {
         std::fs::write(path, raw).map_err(|e| Error::io(path, e))
     }
 
+    /// 按当前配置的识别模型解析出的权重集。
+    pub fn model_set(&self) -> ModelSet {
+        ModelSet::from_root(&self.models_dir, self.engine.asr_model)
+    }
+
     pub fn db_path(&self) -> PathBuf {
         self.data_dir.join("vocmeet.db")
     }
@@ -376,11 +394,31 @@ mod tests {
         c.engine.num_threads = 8;
         c.save(&p).unwrap();
 
+        c.engine.asr_model = AsrModel::FireRedAed;
+        c.save(&p).unwrap();
+
         let back = Config::load(&p).unwrap();
+        assert_eq!(back.engine.asr_model, AsrModel::FireRedAed);
         assert_eq!(back.llm.model, "qwen3:8b");
         assert_eq!(back.engine.num_threads, 8);
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn fresh_install_defaults_to_fire_red() {
+        assert_eq!(Config::default().engine.asr_model, AsrModel::FireRedAed);
+        // 没有配置文件 = 新装
+        let c = Config::load("no-such-config-file.json").unwrap();
+        assert_eq!(c.engine.asr_model, AsrModel::FireRedAed);
+    }
+
+    #[test]
+    fn old_config_without_asr_model_keeps_sense_voice() {
+        // 升级前的配置文件没有这个字段，不能因此读不出来或悄悄换模型。
+        let c: Config = serde_json::from_str(r#"{"engine":{"num_threads":4}}"#).unwrap();
+        assert_eq!(c.engine.asr_model, AsrModel::SenseVoice);
+        assert_eq!(c.engine.num_threads, 4);
     }
 
     #[test]

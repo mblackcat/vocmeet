@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
 # 下载并校验 VocMeet 所需的 ONNX 权重。
 #
-# 用法：  bash scripts/fetch-models.sh [目标目录]
+# 用法：  bash scripts/fetch-models.sh [目标目录] [识别模型]
 # 默认目标目录为 ./models
+# 识别模型：fire_red_aed（默认，与新装应用一致）| sense_voice，与配置里 engine.asr_model 同名
 #
 # 权重不入库（见 .gitignore）。所有资产来自 sherpa-onnx 官方 GitHub Release。
-# 许可证注意：SenseVoice / CT-Punc 属阿里 FunASR 模型开源协议，商业化前需法务结论，
+# 许可证注意：FireRedASR2 为 Apache-2.0；SenseVoice / CT-Punc 属阿里 FunASR 模型开源协议，商业化前需法务结论，
 # 详见 docs/vocmeet_mvp_plan.md §8.2。
 
 set -euo pipefail
 
 DEST="${1:-models}"
+ASR="${2:-fire_red_aed}"
 BASE="https://github.com/k2-fsa/sherpa-onnx/releases/download"
 
 mkdir -p "$DEST"
@@ -37,10 +39,24 @@ untar() { # archive marker_dir
   tar xf "$archive"
 }
 
-echo "==> ASR: SenseVoice int8 (2025-09-09)"
-fetch "$BASE/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2" \
-      "sense-voice.tar.bz2"
-untar "sense-voice.tar.bz2" "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
+case "$ASR" in
+  sense_voice)
+    echo "==> ASR: SenseVoice int8 (2025-09-09)"
+    fetch "$BASE/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09.tar.bz2" \
+          "sense-voice.tar.bz2"
+    untar "sense-voice.tar.bz2" "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-int8-2025-09-09"
+    ;;
+  fire_red_aed)
+    echo "==> ASR: FireRedASR2 AED int8 (2026-02-26, Apache-2.0)"
+    fetch "$BASE/asr-models/sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26.tar.bz2" \
+          "fire-red-aed.tar.bz2"
+    untar "fire-red-aed.tar.bz2" "sherpa-onnx-fire-red-asr2-zh_en-int8-2026-02-26"
+    ;;
+  *)
+    echo "未知识别模型：$ASR（可选 sense_voice | fire_red_aed）" >&2
+    exit 1
+    ;;
+esac
 
 echo "==> VAD: Silero"
 fetch "$BASE/asr-models/silero_vad.onnx" "silero_vad.onnx"

@@ -14,7 +14,7 @@ import type {
   UpdateCheckPayload,
   UpdateProgressEvent,
 } from "../types";
-import { formatBytes, formatTs } from "../types";
+import { ASR_MODELS, formatBytes, formatTs } from "../types";
 import QuickNav from "../components/QuickNav";
 
 interface Props {
@@ -507,6 +507,30 @@ export default function Settings({ onError, onMeetingChanged }: Props) {
           <p className="note" style={{ marginTop: 0, marginBottom: 12 }}>
             语音识别模型不随安装包提供，需手动下载安装。首次下载默认存放于应用内的 models 目录。
           </p>
+
+          <div className="set-row">
+            <span className="k">识别模型</span>
+            <span className="v">
+              {ASR_MODELS.map((m) => (
+                <label className="choice" key={m.id} style={{ padding: 0 }}>
+                  <input
+                    type="radio"
+                    name="asr-model"
+                    checked={cfg.engine.asr_model === m.id}
+                    disabled={!!fetching}
+                    onChange={() => {
+                      const next = { ...cfg, engine: { ...cfg.engine, asr_model: m.id } };
+                      void persist(next).then(refreshDoctor);
+                    }}
+                  />
+                  <span className="c-t">
+                    {m.label} · {m.note}
+                  </span>
+                </label>
+              ))}
+              <div className="note">换模型后如提示缺失，点下方「一键下载模型」即可，只会下载新模型本身。</div>
+            </span>
+          </div>
 
           {report && (
             <>

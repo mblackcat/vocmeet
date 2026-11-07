@@ -118,7 +118,16 @@ export interface LlmConfig {
   request_timeout_secs: number;
 }
 
+/** 识别模型。与 Rust 端 `models::AsrModel` 一一对应。 */
+export type AsrModel = "sense_voice" | "fire_red_aed";
+
+export const ASR_MODELS: Array<{ id: AsrModel; label: string; note: string }> = [
+  { id: "fire_red_aed", label: "FireRedASR2（默认）", note: "中文更准，方言与中英混说明显更好；模型约 840MB，识别耗时约为 SenseVoice 的 6~7 倍" },
+  { id: "sense_voice", label: "SenseVoice", note: "体积小（约 170MB）、速度快，中文准确率一般；低配机器可选" },
+];
+
 export interface EngineConfig {
+  asr_model: AsrModel;
   num_threads: number;
   provider: string;
   cluster_threshold: number;

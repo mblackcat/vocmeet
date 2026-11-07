@@ -12,6 +12,7 @@ use std::sync::Arc;
 use sherpa_onnx::{
     FastClusteringConfig, OfflinePunctuation, OfflinePunctuationConfig,
     OfflinePunctuationModelConfig, OfflineRecognizer, OfflineRecognizerConfig,
+    OfflineFireRedAsrModelConfig,
     OfflineSenseVoiceModelConfig, OfflineSpeakerDiarization, OfflineSpeakerDiarizationConfig,
     OfflineSpeakerSegmentationModelConfig, OfflineSpeakerSegmentationPyannoteModelConfig,
     SileroVadModelConfig, SpeakerEmbeddingExtractorConfig, VadModelConfig, VoiceActivityDetector,
@@ -19,7 +20,7 @@ use sherpa_onnx::{
 
 use crate::align::{self, DiarSegment, SpeechSegment};
 use crate::audio::Pcm;
-use crate::models::ModelSet;
+use crate::models::{AsrModel, ModelSet};
 use crate::{Error, Result, Source, Utterance, LOCAL_SPEAKER_ID, TARGET_SAMPLE_RATE};
 
 /// 进度阶段。UI 用它渲染「阶段 + 百分比」，见 §6。
@@ -185,12 +186,27 @@ impl SherpaEngine {
         models.verify_present()?;
 
         let mut rec_config = OfflineRecognizerConfig::default();
-        rec_config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
-            model: Some(path_str(&models.asr_model)?),
-            language: Some("auto".to_string()),
-            // 逆文本正则化：把「二零二六年」转成「2026年」，纪要可读性提升明显。
-            use_itn: true,
-        };
+        let model = Some(path_str(&models.asr_model)?);
+        match models.asr {
+            AsrModel::SenseVoice => {
+                rec_config.model_config.sense_voice = OfflineSenseVoiceModelConfig {
+                    model,
+                    language: Some("auto".to_string()),
+                    // 逆文本正则化：把「二零二六年」转成「2026年」，纪要可读性提升明显。
+                    use_itn: true,
+                };
+            }
+            AsrModel::FireRedAed => {
+                let decoder = models
+                    .asr_decoder
+                    .as_deref()
+                    .ok_or_else(|| Error::engine("FireRedASR2-AED 缺少 decoder 路径"))?;
+                rec_config.model_config.fire_red_asr = OfflineFireRedAsrModelConfig {
+                    encoder: model,
+                    decoder: Some(path_str(decoder)?),
+                };
+            }
+        }
         rec_config.model_config.tokens = Some(path_str(&models.asr_tokens)?);
         rec_config.model_config.provider = Some(opts.provider.clone());
         rec_config.model_config.num_threads = opts.num_threads;
