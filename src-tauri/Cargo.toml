@@ -12,8 +12,6 @@ tauri-build = { version = "2", features = [] }
 vocmeet-core = { path = "../crates/core" }
 vocmeet-capture = { path = "../crates/capture" }
 tauri = { version = "2", features = ["protocol-asset", "tray-icon", "image-png"] }
-[target.'cfg(windows)'.dependencies]
-windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
@@ -21,6 +19,11 @@ anyhow = "1"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# 必须放在 [dependencies] 之后：TOML 表头一直管到下一个表头为止，
+# 插在中间会把后面的依赖全变成 Windows 专属，macOS 上直接编不过。
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.61", features = ["Win32_Foundation", "Win32_UI_WindowsAndMessaging"] }
 
 [features]
 custom-protocol = ["tauri/custom-protocol"]
